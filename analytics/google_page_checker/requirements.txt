@@ -1,0 +1,9 @@
+playwright==1.56.0
+openpyxl==3.1.2
+pandas>=2.0.0,<3.0.0
+
+# playwright 1.40 падал на Response.request с
+# "'dict' object has no attribute '_object'" — в боевом логе это ловилось
+# около десяти раз за прогон и каждый раз роняло попытку загрузки сайта.
+# Работает любая версия 1.55+; на 1.56.0 прогонялись тесты.
+# Chromium ставится отдельно: playwright install chromium
