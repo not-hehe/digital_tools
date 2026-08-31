@@ -84,4 +84,4 @@ shared/        общие модули
 
 ## Автор
 
-Иван Минько, [@ivan_minko](https://github.com/not-hehe)
+Иван Минько, [minkoivan2004@gmail.com](https://github.com/not-hehe)
