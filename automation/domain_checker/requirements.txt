@@ -1,0 +1,8 @@
+requests>=2.31
+openpyxl==3.1.5
+pandas>=2.0.0,<3.0.0
+
+# pandas тянется только ради excel_reader, перенесённого из
+# analytics/google_page_checker: он построен на pd.read_excel. Если на сервере
+# pandas нежелателен, чтение переводится на голый openpyxl — ядра не касается.
+# Проверялось на Python 3.9.6: requests 2.32.5, openpyxl 3.1.5, pandas 2.3.3.
