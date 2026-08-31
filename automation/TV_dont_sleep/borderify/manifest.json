@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "TV Don't Sleep",
+  "version": "2.0",
+  "description": "Карусель вкладок для ТВ-дашбордов: листает вкладки по таймеру, обновляет их перед показом и не даёт экрану уснуть",
+
+  "icons": {
+    "16": "icons/lain-16.png",
+    "32": "icons/lain-32.png",
+    "48": "icons/lain-48.png",
+    "96": "icons/lain-96.png",
+    "128": "icons/lain-128.png"
+  },
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "tv_dont_sleep@danilak",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+
+  "permissions": ["tabs", "alarms", "storage"],
+  "host_permissions": ["<all_urls>"],
+
+  "background": {
+    "scripts": ["background.js"]
+  },
+
+  "action": {
+    "default_title": "TV Don't Sleep — клик: вкл/выкл карусель",
+    "default_icon": {
+      "16": "icons/lain-16.png",
+      "32": "icons/lain-32.png"
+    }
+  },
+
+  "options_ui": {
+    "page": "options.html"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["wakelock.js"]
+    }
+  ]
+}
