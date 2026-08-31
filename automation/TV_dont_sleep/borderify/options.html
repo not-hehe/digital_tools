@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font-family: system-ui, sans-serif; font-size: 14px; padding: 12px; min-width: 320px; }
+    label { display: block; margin-bottom: 12px; }
+    input[type="number"] { width: 70px; margin-left: 6px; }
+    button { padding: 6px 16px; }
+    #status { color: #2e7d32; margin-left: 10px; }
+    .hint { color: #666; font-size: 12px; margin-top: 14px; }
+  </style>
+</head>
+<body>
+  <form id="form">
+    <label>
+      Показывать каждую вкладку, минут:
+      <input type="number" id="displayMinutes" min="1" max="1440" required />
+    </label>
+    <label>
+      Пауза после обновления страницы, секунд:
+      <input type="number" id="reloadDelaySec" min="0" max="20" required />
+    </label>
+    <button type="submit">Сохранить</button><span id="status"></span>
+  </form>
+  <p class="hint">
+    Вкл/выкл карусели — кликом по иконке расширения на панели (бейдж ON/OFF).<br />
+    Чтобы экран не засыпал, выдай расширению доступ ко всем сайтам:
+    about:addons → TV Don't Sleep → Разрешения.
+  </p>
+  <script src="options.js"></script>
+</body>
+</html>
