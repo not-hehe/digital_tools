@@ -1,7 +1,6 @@
 import concurrent.futures
 import logging
 import time
-from datetime import datetime
 from typing import List, Optional
 from urllib.parse import urljoin
 
@@ -9,15 +8,11 @@ import requests
 
 from .failures import (classify_exception, failure_label, FAIL_REDIRECT_LOOP,
                        FAIL_INVALID_URL, FAIL_OTHER)
-from .urls import label_of, looks_like_url, normalize
-from .config import (REQUEST_TIMEOUT, MAX_REDIRECTS, MAX_WORKERS, USER_AGENT,
-                     TRUST_ENV, HEALTHY_MIN, HEALTHY_MAX, MSK)
+from ..urls import label_of, looks_like_url, normalize
+from ..config import (REQUEST_TIMEOUT, MAX_REDIRECTS, MAX_WORKERS, USER_AGENT,
+                     TRUST_ENV, HEALTHY_MIN, HEALTHY_MAX, now_msk)
 
 logger = logging.getLogger(__name__)
-
-
-def _now_msk() -> datetime:
-    return datetime.now(tz=MSK).replace(tzinfo=None)
 
 
 def blank_result(url: str, label: str = None) -> dict:
@@ -25,6 +20,10 @@ def blank_result(url: str, label: str = None) -> dict:
     return {
         "url": url,
         "label": label or label_of(url),
+        # Проставляется из цели в check_all. Нужна не проверке, а разбору
+        # результата: массовый отказ одного контура это отказ маршрута,
+        # а не столько же независимых аварий.
+        "contour": "unknown",
         "ok": False,
         "status_code": None,
         "final_url": None,
@@ -33,12 +32,23 @@ def blank_result(url: str, label: str = None) -> dict:
         "failure_kind": None,
         "failure_label": None,
         "error": None,
-        "checked_at": _now_msk(),
+        "checked_at": now_msk(),
     }
 
 
 def is_healthy(status_code: Optional[int]) -> bool:
     return status_code is not None and HEALTHY_MIN <= status_code < HEALTHY_MAX
+
+
+def reason_of(result: dict) -> str:
+    """Человекочитаемая причина: код ответа, если он есть, иначе вид отказа.
+
+    Живёт рядом с моделью результата, а не в отчётах: сообщение о событии
+    и сводка о прогоне описывают одно и то же одинаково.
+    """
+    if result.get("status_code") is not None:
+        return "HTTP {}".format(result["status_code"])
+    return result.get("failure_label") or "причина не определена"
 
 
 def _new_session() -> requests.Session:
@@ -121,8 +131,10 @@ def check_all(targets: List[dict], max_workers: int = None,
         # общая на пул давала бы гонки на пуле соединений.
         try:
             with _new_session() as session:
-                return check_domain(target["url"], target.get("label"),
-                                    timeout=timeout, session=session)
+                result = check_domain(target["url"], target.get("label"),
+                                      timeout=timeout, session=session)
+            result["contour"] = target.get("contour") or "unknown"
+            return result
         except Exception as e:
             # Сбой ВНЕ check_domain (битая цель, отказ создания сессии).
             # Без этого ex.map поднял бы исключение при чтении результатов,
