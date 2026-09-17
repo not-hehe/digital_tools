@@ -266,7 +266,7 @@ Heartbeat рождается из боевого прогона, а не из о
 Тесты:
 
 ```bash
-venv/bin/python tests/test_logic.py      # 36 тестов логики, сеть не нужна
+venv/bin/python tests/test_logic.py      # 41 тест логики, сеть не нужна
 venv/bin/python tests/test_e2e_local.py  # 6 проверок на локальных серверах
 ```
 

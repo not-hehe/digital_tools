@@ -30,8 +30,26 @@ if [ ! -x "$PYTHON" ]; then
     PYTHON="$(command -v python3)"
 fi
 
-LOG="$(mktemp -t domain-checker)"
-trap 'rm -f "$LOG"' EXIT
+# Временный файл под вывод прогона. mktemp ведёт себя по-разному: на macOS
+# флаг -t принимает голое имя, а GNU mktemp на Linux требует шаблон с XXXXXX
+# и без него падает с "too few X's in template".
+OS="$(uname -s)"
+if [ "$OS" = "Darwin" ]; then
+    LOG="$(mktemp -t domain-checker)"
+elif [ "$OS" = "Linux" ]; then
+    LOG="$(mktemp "${TMPDIR:-/tmp}/domain-checker.XXXXXX")"
+else
+    # Незнакомая система: шаблон с XXXXXX понимают все известные реализации.
+    LOG="$(mktemp "/tmp/domain-checker.XXXXXX")"
+fi
+
+# Без временного файла прогон всё равно состоится, но сообщение о сбое ушло бы
+# без хвоста лога. Говорим об этом вслух, а не молча пишем в никуда.
+if [ -z "$LOG" ]; then
+    echo "run.sh: не удалось создать временный файл, хвост лога в сообщение о сбое не попадёт" >&2
+    LOG="/dev/null"
+fi
+trap '[ "$LOG" != "/dev/null" ] && rm -f "$LOG"' EXIT
 
 "$PYTHON" main.py "$@" 2>&1 | tee "$LOG"
 CODE=${PIPESTATUS[0]}
