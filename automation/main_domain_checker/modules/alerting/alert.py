@@ -17,8 +17,8 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 from ..probe import reason_of
-from ..config import (GUARD_MIN_ITEMS, MASS_FAILURE_RATIO, MATTERMOST_TIMEOUT,
-                     now_msk)
+from ..config import (GROUP_WINDOW_MINUTES, GUARD_MIN_ITEMS, LONE_DOWN_HOURS,
+                     MASS_FAILURE_RATIO, MATTERMOST_TIMEOUT, now_msk)
 from .notifier import send_to_mattermost
 
 logger = logging.getLogger(__name__)
@@ -212,11 +212,30 @@ def build_event_alert(events: List[dict], checked: int,
         return guard
 
     lines = []
-    if fell:
-        lines.append("🔴 Упали: {}".format(len(fell)))
+    # Долгие одиночные падения и массовые отдельно: у них разный смысл.
+    # Массовое на нынешних данных почти всегда сбой самой машины проверки,
+    # и читатель должен видеть это первой строкой, а не вычислять по списку.
+    lone = [e for e in fell if e.get("alert") == "lone"]
+    rest = [e for e in fell if e.get("alert") != "lone"]
+    if rest:
+        lines.append("🔴 Упали: {}".format(len(rest)))
+        if any(e.get("alert") == "group" for e in rest):
+            lines.append("Разом, в пределах {} минут. Несколько независимых "
+                         "аварий одновременно - редкость,\nначните с машины "
+                         "проверки.".format(GROUP_WINDOW_MINUTES))
         lines.append("")
         lines += _render_groups(_group(
-            fell, lambda e: e.get("reason") or "причина не определена"))
+            rest, lambda e: e.get("reason") or "причина не определена"))
+    if lone:
+        lines.append("🔴 Не отвечают дольше {} часов: {}".format(
+            LONE_DOWN_HOURS, len(lone)))
+        lines.append("")
+        for e in lone:
+            since = (e.get("since") or "").replace("T", " ")[:16]
+            lines.append("  {} - {}{}".format(
+                e["label"], e.get("reason") or "причина не определена",
+                " (с {})".format(since) if since else ""))
+        lines.append("")
     if rose:
         lines.append("🟢 Поднялись: {}".format(len(rose)))
         for e in rose:

@@ -196,12 +196,13 @@ Temporary Items
 # Внутренняя документация разработки. Наружу не публикуется и в репозитории
 # не попадает вообще: пайплайн, журнал, открытые вопросы, разборы. Наружу
 # из документации идёт максимум README.md проекта.
-automation/domain_checker/docs/*
-# Исключение по белому списку: три документа для читателя кода.
+automation/main_domain_checker/docs/*
+# Исключение по белому списку: документы для читателя кода и журнал изменений.
 # Всё остальное в docs/ остаётся закрытым, включая любые новые файлы.
-!automation/domain_checker/docs/code.md
-!automation/domain_checker/docs/architecture.md
-!automation/domain_checker/docs/monitoring-practices.md
+!automation/main_domain_checker/docs/code.md
+!automation/main_domain_checker/docs/architecture.md
+!automation/main_domain_checker/docs/monitoring-practices.md
+!automation/main_domain_checker/docs/CHANGELOG.md
 
 
 # Входные списки адресов и любые их производные. Это рабочие данные,
