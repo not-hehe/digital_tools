@@ -36,7 +36,7 @@ main.py               один прогон и выход, планировщи�
 | `urls.py` | нормализация адреса, отсев мусора | 1 |
 | `sources/` | откуда берётся список доменов | `targets.py`, `excel_reader.py` |
 | `probe/` | как проверяется домен | `checker.py`, `failures.py` |
-| `alerting/` | что делать с результатом | `state.py`, `alert.py`, `notifier.py` |
+| `alerting/` | что делать с результатом | `state.py`, `runlog.py`, `alert.py`, `notifier.py` |
 
 Зависимости идут в одну сторону, циклов нет (проверено обходом импортов):
 
@@ -70,12 +70,13 @@ check_all`. Файл внутри слоя можно переименовать
 | `modules/probe/checker.py` | 154 | `check_domain`, `check_all`, `reason_of` |
 | `modules/probe/failures.py` | 71 | таксономия отказов по исключениям `requests` |
 | `modules/alerting/state.py` | 133 | память между запусками, события смены статуса |
+| `modules/alerting/runlog.py` | 110 | текстовый лог прогонов и событий |
 | `modules/alerting/alert.py` | 253 | тексты сообщений и предохранители |
 | `modules/alerting/notifier.py` | 34 | отправка в Mattermost на stdlib |
 | `tools/notify.py` | 43 | отправка готового текста в Mattermost, нужна `run.sh` |
 | `tools/classify_contours.py` | 117 | разовая разметка доменов по контурам |
 | `tools/survey.py` | 118 | серия наблюдений из одной точки, поиск моргающих доменов |
-| `tests/test_logic.py` | 508 | 41 тест логики, сеть не нужна |
+| `tests/test_logic.py` | 508 | 51 тест логики, сеть не нужна |
 | `tests/test_e2e_local.py` | 208 | 6 проверок на живых локальных серверах |
 
 ## Формы данных
@@ -123,11 +124,19 @@ check_all`. Файл внутри слоя можно переименовать
 ```python
 {"version": 1,
  "updated_at": "2026-09-10T17:45:37",
- "domains": {"example.com": {"fails": 1, "down": False, "since": None}}}
+ "domains": {"example.com": {"fails": 1, "down": False, "since": None},
+             "dead.example.com": {"fails": 7, "down": True,
+                                  "since": "2026-10-05T09:15:00", "reported": False,
+                                  "url": "https://dead.example.com",
+                                  "contour": "external", "reason": "HTTP 503"}}}
 ```
 
 `fails` - сколько неудачных прогонов подряд. Домен признаётся упавшим, когда
-их набирается `CONFIRM_FAILS` (сейчас 2). `since` - когда признали.
+их набирается `CONFIRM_FAILS` (сейчас 3). `since` - когда признали.
+`reported` - сообщали ли о падении: в канал идёт группа от `GROUP_MIN_DOWN`
+доменов в окне `GROUP_WINDOW_MINUTES` или одиночное падение после
+`LONE_DOWN_HOURS` (`pick_alerts` в `state.py`); `url`, `contour`, `reason`
+хранятся ради этого отложенного сообщения.
 
 **Event** - смена статуса, единственное, о чём сообщаем в канал по расписанию.
 
@@ -203,7 +212,7 @@ check_all`. Файл внутри слоя можно переименовать
 ## Тесты
 
 ```bash
-venv/bin/python tests/test_logic.py       # 41 тест, сеть не нужна, ~1 с
+venv/bin/python tests/test_logic.py       # 51 тест, сеть не нужна, ~1 с
 venv/bin/python tests/test_e2e_local.py   # 6 проверок на 127.0.0.1, ~5 с
 ```
 

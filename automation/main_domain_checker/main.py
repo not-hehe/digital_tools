@@ -18,8 +18,9 @@ import sys
 
 from modules.alerting import (EVENT_DOWN, EVENT_UP, apply_results,
                               build_alert, build_event_alert, build_heartbeat,
-                              due_for_heartbeat, load_state, mark_heartbeat,
-                              save_state, send)
+                              due_for_heartbeat, event_lines, load_state,
+                              mark_heartbeat, pick_alerts, run_line,
+                              runlog_append, save_state, send)
 from modules.config import (INPUT_FILE, LOG_FORMAT, LOG_LEVEL,
                             MATTERMOST_WEBHOOK_URL, STATE_FILE)
 from modules.probe import check_all
@@ -106,14 +107,20 @@ def run_full(loaded: dict, no_notify: bool) -> int:
 
     state = load_state()
     state, events = apply_results(state, results)
+    # В канал идёт не каждое подтверждённое падение, а группа или долгое
+    # одиночное; признаки "сообщено" ложатся в то же состояние.
+    state, alerts = pick_alerts(state, events)
 
     # Признак жизни считаем до сохранения, чтобы отметка легла в тот же файл.
     beat = due_for_heartbeat(state)
     if beat:
         mark_heartbeat(state)
     saved = save_state(state)
+    # Лог прогонов пишется до отправки и независимо от неё: в нём должно
+    # остаться и то, о чём канал промолчал.
+    runlog_append([run_line(results)] + event_lines(events))
 
-    text = build_event_alert(events, len(results),
+    text = build_event_alert(alerts, len(results),
                              contour_counts=loaded["counts"])
     print()
     if text is not None:
@@ -128,11 +135,11 @@ def run_full(loaded: dict, no_notify: bool) -> int:
                         no_notify)
 
     print("Проверено {}, проблемных {}, упало {}, поднялось {}, "
-          "отправлено {}".format(
+          "в сообщение попало {}, отправлено {}".format(
               len(results), problems_count,
               sum(1 for e in events if e["event"] == EVENT_DOWN),
               sum(1 for e in events if e["event"] == EVENT_UP),
-              "да" if notified else "нет"))
+              len(alerts), "да" if notified else "нет"))
 
     # Проверка идёт после отправки: события этого прогона уже посчитаны,
     # и терять их из-за недоступного диска незачем. А дальше - ненулевой код.

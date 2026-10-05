@@ -12,6 +12,7 @@ import json
 import logging
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -19,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import requests
 from openpyxl import Workbook
 
-from modules.alerting import alert, state as st
+from modules.alerting import alert, runlog as rl, state as st
+from modules.config import CONFIRM_FAILS
 from modules.probe import failures as f
 from modules.probe.checker import (blank_result, check_all, check_domain,
                                    is_healthy, reason_of)
@@ -255,8 +257,18 @@ def test_state_confirms_failure_over_two_runs():
     ]
     for ok, expected, why in steps:
         result = ok_result() if ok else bad_result("a.example.com", code=503)
-        s, events = st.apply_results(s, [result])
+        s, events = st.apply_results(s, [result], confirm_fails=2)
         assert [e["event"] for e in events] == expected, why
+
+
+def test_state_default_confirms_on_third_run():
+    """На ВМ двойка давала шум: 39 из 57 падений поднимались следующим прогоном."""
+    s = st.empty_state()
+    seen = []
+    for _ in range(3):
+        s, events = st.apply_results(s, [bad_result("a.example.com", code=503)])
+        seen.append([e["event"] for e in events])
+    assert seen == [[], [], ["down"]]
 
 
 def test_state_roundtrip_and_degradation():
@@ -282,7 +294,7 @@ def test_state_forgets_domains_out_of_list():
 
 def test_state_carries_contour_into_events():
     s = st.empty_state()
-    for _ in range(2):
+    for _ in range(CONFIRM_FAILS):
         s, events = st.apply_results(
             s, [bad_result("a.example.com", code=500, contour="internal")])
     assert events[0]["contour"] == "internal"
@@ -480,6 +492,129 @@ def test_heartbeat_survives_apply_results():
     stamp = state["last_heartbeat"]
     new_state, _ = st.apply_results(state, [ok_result("a.example.com")])
     assert new_state.get("last_heartbeat") == stamp
+
+
+# ---------------------------------------------------------------------------
+# Что из падений идёт в канал: группа или долгое одиночное
+# ---------------------------------------------------------------------------
+
+def _down_state(labels_since):
+    """Состояние с подтверждёнными, но несообщёнными падениями."""
+    return {"version": 1, "updated_at": None, "domains": {
+        label: {"fails": 3, "down": True, "since": since, "reported": False,
+                "url": "https://" + label, "contour": "unknown",
+                "reason": "HTTP 503"}
+        for label, since in labels_since.items()}}
+
+
+def test_pick_alerts_needs_a_group_within_window():
+    now = datetime(2026, 10, 5, 12, 0)
+    two = _down_state({"a": "2026-10-05T11:50:00", "b": "2026-10-05T11:55:00"})
+    s, alerts = st.pick_alerts(two, [], now=now)
+    assert alerts == [], "двое в окне - молчим"
+    assert not any(d["reported"] for d in s["domains"].values())
+
+    three = _down_state({"a": "2026-10-05T11:50:00", "b": "2026-10-05T11:55:00",
+                         "c": "2026-10-05T12:00:00"})
+    s, alerts = st.pick_alerts(three, [], now=now)
+    assert sorted(e["label"] for e in alerts) == ["a", "b", "c"]
+    assert all(e["alert"] == "group" for e in alerts)
+    assert all(d["reported"] for d in s["domains"].values())
+
+
+def test_pick_alerts_group_ignores_old_fallen():
+    """Третий, упавший час назад, группу не составляет: окно 15 минут."""
+    now = datetime(2026, 10, 5, 12, 0)
+    s = _down_state({"a": "2026-10-05T11:50:00", "b": "2026-10-05T11:55:00",
+                     "old": "2026-10-05T11:00:00"})
+    _, alerts = st.pick_alerts(s, [], now=now)
+    assert alerts == []
+
+
+def test_pick_alerts_lone_after_hours():
+    now = datetime(2026, 10, 5, 12, 0)
+    s = _down_state({"a": "2026-10-04T20:05:00", "b": "2026-10-04T19:55:00"})
+    s, alerts = st.pick_alerts(s, [], now=now)
+    assert [e["label"] for e in alerts] == ["b"], "16 часов есть только у b"
+    assert alerts[0]["alert"] == "lone"
+    assert s["domains"]["b"]["reported"] and not s["domains"]["a"]["reported"]
+    # Сообщённый больше не ждёт: повторный вызов молчит.
+    _, again = st.pick_alerts(s, [], now=now + timedelta(hours=1))
+    assert [e["label"] for e in again] == ["a"]
+
+
+def test_pick_alerts_reports_rise_only_if_fall_was_reported():
+    up_silent = {"event": "up", "label": "q", "reported": False, "since": "x"}
+    up_loud = {"event": "up", "label": "r", "reported": True, "since": "x"}
+    _, alerts = st.pick_alerts(st.empty_state(), [up_silent, up_loud])
+    assert [e["label"] for e in alerts] == ["r"]
+
+
+def test_reported_flag_survives_runs_and_resets_on_rise():
+    """Признак "сообщено" живёт в состоянии и исчезает вместе с падением."""
+    s = st.empty_state()
+    for _ in range(3):
+        s, events = st.apply_results(s, [bad_result("a.example.com", code=503)])
+    s, alerts = st.pick_alerts(s, events, now=datetime(2030, 1, 1))
+    assert alerts and s["domains"]["a.example.com"]["reported"] is True
+    s, _ = st.apply_results(s, [bad_result("a.example.com", code=503)])
+    assert s["domains"]["a.example.com"]["reported"] is True, "переживает прогон"
+    assert s["domains"]["a.example.com"]["reason"] == "HTTP 503"
+    s, events = st.apply_results(s, [ok_result("a.example.com")])
+    assert events[0]["reported"] is True
+    assert "reported" not in s["domains"]["a.example.com"]
+
+
+def test_event_alert_separates_lone_and_group():
+    group = [dict(e, alert="group") for e in down_event(3)]
+    lone = [{"event": "down", "label": "lone.example.com", "url": "x",
+             "since": "2026-10-04T20:00:00", "reason": "HTTP 503",
+             "contour": "unknown", "alert": "lone"}]
+    text = alert.build_event_alert(group + lone, checked=100)
+    assert "Упали: 3" in text and "начните с машины проверки" in text
+    assert "Не отвечают дольше 16 часов: 1" in text
+    assert "lone.example.com - HTTP 503 (с 2026-10-04 20:00)" in text
+
+
+# ---------------------------------------------------------------------------
+# Лог прогонов и событий
+# ---------------------------------------------------------------------------
+
+def test_runlog_writes_run_and_events():
+    tmp = Path(tempfile.mkdtemp()) / "runs.log"
+    results = [ok_result("a.example.com"), bad_result("b.example.com", code=503)]
+    s, events = st.apply_results(st.empty_state(), results, confirm_fails=1)
+    assert rl.append([rl.run_line(results)] + rl.event_lines(events), path=tmp)
+    lines = rl.read_lines(tmp)
+    assert len(lines) == 2
+    assert lines[0].endswith("прогон    проверено 2, не ответили 1: b.example.com (HTTP 503)")
+    assert lines[1].endswith("упал      b.example.com - HTTP 503")
+    s, events = st.apply_results(s, [ok_result("b.example.com")])
+    rl.append(rl.event_lines(events), path=tmp)
+    assert "поднялся  b.example.com - не отвечал с 20" in rl.read_lines(tmp)[2]
+    # Строка на прогон пишется и когда событий нет: по ним считают ритм.
+    assert rl.append([rl.run_line([ok_result("a.example.com")])], path=tmp)
+    assert len(rl.read_lines(tmp, kind="прогон")) == 2
+    assert rl.read_lines(tmp, kind="прогон")[1].endswith("проверено 1, не ответили 0")
+
+
+def test_runlog_is_trimmed_with_slack():
+    """Обрезка с запасом: иначе файл переписывался бы каждый прогон."""
+    tmp = Path(tempfile.mkdtemp()) / "runs.log"
+    for i in range(10):
+        rl.append(["строка {}".format(i)], path=tmp, max_lines=10)
+    assert len(rl.read_lines(tmp)) == 10
+    rl.append(["строка 10"], path=tmp, max_lines=10)
+    assert len(rl.read_lines(tmp)) == 11, "в пределах запаса файл не трогаем"
+    rl.append(["строка 11"], path=tmp, max_lines=10)
+    assert rl.read_lines(tmp) == ["строка {}".format(i) for i in range(2, 12)], \
+        "за пределом запаса остаётся хвост"
+
+
+def test_runlog_failure_does_not_raise():
+    missing_dir = Path(tempfile.mkdtemp()) / "нет" / "runs.log"
+    assert rl.append(["строка"], path=missing_dir) is False
+    assert rl.read_lines(missing_dir) == []
 
 
 def test_heartbeat_with_broken_stamp_is_due():
