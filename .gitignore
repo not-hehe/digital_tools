@@ -219,3 +219,12 @@ automation/main_domain_checker/docs/*
 # Сборка под внешний контур: пока совпадает с основной, различия ещё
 # не внесены. Убрать эту строку, когда контуры разойдутся.
 analytics/google_page_checker_outside/
+
+# collector_checker: рабочий список содержит хосты работодателя, состояние
+# и журнал - данные прогонов. Образец списка остаётся в репозитории.
+automation/collector_checker/data/collectors.txt
+automation/collector_checker/data/state.txt
+automation/collector_checker/data/state.txt.tmp
+automation/collector_checker/data/.run.lock/
+automation/collector_checker/data/runs.log
+automation/collector_checker/logs/

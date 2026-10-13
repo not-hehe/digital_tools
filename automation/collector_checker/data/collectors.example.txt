@@ -1,0 +1,16 @@
+# имя  адрес
+v1 https://collector.example.com/com.google.analytics/v1
+v2 https://collector.example.com/com.google.analytics/v2
+v3 https://collector.example.com/com.google.analytics/v3
+v4 https://collector.example.com/com.google.analytics/v4
+v5 https://collector.example.com/com.google.analytics/v5
+v6 https://collector.example.com/com.google.analytics/v6
+v7 https://collector.example.com/com.google.analytics/v7
+v8 https://collector.example.com/com.google.analytics/v8
+v9 https://collector.example.com/com.google.analytics/v9
+v10 https://collector.example.com/com.google.analytics/v10
+v11 https://collector.example.com/com.google.analytics/v11
+v12 https://collector.example.com/com.google.analytics/v12
+v13 https://collector.example.com/com.google.analytics/v13
+v14 https://collector.example.com/com.google.analytics/v14
+v15 https://collector.example.com/com.google.analytics/v15
