@@ -59,13 +59,13 @@ alert() {
 
 fail_start() {
     log "$1"
-    alert "$(printf 'Прогон collector_checker не стартовал: %s\n\nХост: %s\nКаталог: %s\nВремя: %s' \
-        "$1" "$(hostname)" "$(pwd)" "$(date '+%Y-%m-%d %H:%M:%S %Z')")"
+    alert "$(printf 'Прогон collector_checker не стартовал: %s\nВремя: %s' \
+        "$1" "$(date '+%Y-%m-%d %H:%M:%S %Z')")"
     exit 1
 }
 
 if ! mkdir -p logs data 2>/dev/null || [ ! -w data ] || [ ! -w logs ]; then
-    fail_start "нет прав на запись в data/ или logs/ ($(pwd))"
+    fail_start "нет прав на запись в data/ или logs/"
 fi
 if [ -z "$PYTHON" ]; then
     fail_start "python не найден: ни venv/bin/python, ни python3 в PATH"
@@ -135,9 +135,11 @@ CODE=$?
 trap - TERM INT
 
 # Код 2 это ошибка в аргументах, то есть человек в терминале: он её видит сам.
+# Недоставленные сообщения кода 1 не дают: это сбой канала, main.py вернёт их
+# в следующий прогон, а сообщать о недоступном Telegram через Telegram бессмысленно.
 if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
-    alert "$(printf 'Прогон collector_checker завершился ошибкой (код %s): список не загружен, состояние не сохранено, сообщение не ушло или python упал\n\nХост: %s\nКаталог: %s\nВремя: %s\n\nПоследние строки лога:\n%s' \
-        "$CODE" "$(hostname)" "$(pwd)" "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
+    alert "$(printf 'Прогон collector_checker завершился ошибкой (код %s): список не загружен, состояние не сохранено или python упал\nВремя: %s\n\nПоследние строки лога:\n%s' \
+        "$CODE" "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
         "$(grep -vE "NotOpenSSLWarning|warnings.warn" "$RUN_OUT" | tail -n 10)")"
 fi
 

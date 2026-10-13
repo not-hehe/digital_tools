@@ -73,3 +73,8 @@ def _trim(path: Path, max_lines: int) -> None:
             f.writelines(lines[-max_lines:])
     except OSError as e:
         logger.error("журнал не подрезан (%s): %s", path, e)
+
+
+def unsent_line(names: List[str]) -> str:
+    return "{} unsent {} (повтор в следующем прогоне)".format(
+        now_msk().strftime(_FMT), ", ".join(names))
