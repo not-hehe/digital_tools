@@ -37,6 +37,7 @@ def build_batches(events: List[dict], group_min: Optional[int] = None) -> List[d
 
 
 def build_messages(events: List[dict], group_min: Optional[int] = None) -> List[str]:
+    # Только тексты: удобно в тестах, в прогоне нужны пакеты с именами.
     return [b["text"] for b in build_batches(events, group_min)]
 
 
@@ -48,8 +49,3 @@ def send_batches(batches: List[dict], sender: Callable[[str], bool]) -> List[str
         if not sender(batch["text"]):
             unsent.extend(batch["names"])
     return unsent
-
-
-def send_all(messages: List[str], sender: Callable[[str], bool]) -> int:
-    """Число неотправленных из списка готовых текстов."""
-    return sum(1 for text in messages if not sender(text))
