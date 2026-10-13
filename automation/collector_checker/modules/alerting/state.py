@@ -27,15 +27,22 @@ _HEADER = "# collector status since(MSK)"
 
 
 def parse_state(text: str) -> Dict[str, dict]:
+    """Битая строка пропускается с предупреждением, остальные живут: обнулять всё
+    из-за одной опечатки значило бы потерять сообщения о подъёме всех лежащих.
+    Коллектор без записи считается живым, и если он лежит, падение придёт снова."""
     state = {}
-    for raw in text.splitlines():
+    for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split()
-        if len(parts) != 3 or parts[1] not in (STATUS_UP, STATUS_DOWN):
-            raise ValueError("строка состояния не разбирается: {!r}".format(raw))
-        state[parts[0]] = {"status": parts[1], "since": datetime.fromisoformat(parts[2])}
+        try:
+            if len(parts) != 3 or parts[1] not in (STATUS_UP, STATUS_DOWN):
+                raise ValueError("ожидается '<имя> up|down <время>'")
+            state[parts[0]] = {"status": parts[1], "since": datetime.fromisoformat(parts[2])}
+        except ValueError as e:
+            print("состояние: строка {} пропущена ({}): {!r}".format(number, e, raw),
+                  file=sys.stderr)
     return state
 
 
@@ -46,7 +53,7 @@ def load_state(path: Optional[Path] = None) -> Dict[str, dict]:
     except FileNotFoundError:
         print("состояние не найдено ({}): первый запуск, все коллекторы считаются "
               "живыми".format(path), file=sys.stderr)
-    except (OSError, ValueError) as e:
+    except OSError as e:
         print("состояние не прочитано ({}): {}. Начинаем с пустого".format(path, e),
               file=sys.stderr)
     return {}

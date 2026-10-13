@@ -228,3 +228,5 @@ automation/collector_checker/data/state.txt.tmp
 automation/collector_checker/data/.run.lock/
 automation/collector_checker/data/runs.log
 automation/collector_checker/logs/
+# Внутренняя документация collector_checker (построчный разбор с хостами) наружу не идёт.
+automation/collector_checker/docs/

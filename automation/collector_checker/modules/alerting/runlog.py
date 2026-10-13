@@ -1,11 +1,9 @@
-import logging
+import sys
 from pathlib import Path
 from typing import List, Optional
 
 from ..config import RUNLOG_FILE, RUNLOG_MAX_LINES, now_msk
 from ..probe import reason_of
-
-logger = logging.getLogger(__name__)
 
 _FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -45,6 +43,7 @@ def event_lines(events: List[dict]) -> List[str]:
 
 def append(lines: List[str], path: Optional[Path] = None,
            max_lines: Optional[int] = None) -> bool:
+    """False, если записать не удалось. Прогон это не роняет: история важна, проверка важнее."""
     path = RUNLOG_FILE if path is None else path
     max_lines = RUNLOG_MAX_LINES if max_lines is None else max_lines
     if not lines:
@@ -53,7 +52,7 @@ def append(lines: List[str], path: Optional[Path] = None,
         with open(path, "a", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line in lines))
     except OSError as e:
-        logger.error("журнал не записан (%s): %s", path, e)
+        print("журнал не записан ({}): {}".format(path, e), file=sys.stderr)
         return False
     _trim(path, max_lines)
     return True
@@ -72,9 +71,10 @@ def _trim(path: Path, max_lines: int) -> None:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(lines[-max_lines:])
     except OSError as e:
-        logger.error("журнал не подрезан (%s): %s", path, e)
+        print("журнал не подрезан ({}): {}".format(path, e), file=sys.stderr)
 
 
 def unsent_line(names: List[str]) -> str:
+    # По этой строке в журнале видно, что сообщение задержалось, а не пропало.
     return "{} unsent {} (повтор в следующем прогоне)".format(
         now_msk().strftime(_FMT), ", ".join(names))

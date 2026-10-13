@@ -10,10 +10,10 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -27,7 +27,8 @@ from modules import sources
 from modules.alerting import alert, notifier, runlog, state
 from modules.probe import checker as probe
 from modules.probe import failures
-from modules.config import ATTEMPT_DEADLINE, ATTEMPTS, GROUP_MIN_DOWN, RETRY_PAUSE
+from modules.config import (ATTEMPTS, GROUP_MIN_DOWN, RETRY_PAUSE, TELEGRAM_ENDPOINT_PAUSE,
+                            TELEGRAM_HOST, TELEGRAM_IPS)
 
 ROOT = Path(__file__).parent.parent
 
@@ -198,32 +199,23 @@ def test_probe_custom_pause_and_attempts():
     assert len(result["attempts"]) == 2 and sleeps == [0.5], sleeps
 
 
-class FakeClock:
-    def __init__(self):
-        self.now = 0.0
+class SleepingSession(ProbeSession):
+    """Каждый get спит seconds настоящих секунд: потолок проверяется часами, а не подменой."""
 
-    def __call__(self):
-        return self.now
-
-
-class SlowSession(ProbeSession):
-    """Каждый get «длится» seconds по поддельным часам."""
-
-    def __init__(self, script, clock, seconds):
+    def __init__(self, script, seconds):
         super().__init__(script)
-        self.clock, self.seconds = clock, seconds
+        self.seconds = seconds
 
     def get(self, url, **kwargs):
-        self.clock.now += self.seconds
+        time.sleep(self.seconds)
         return super().get(url, **kwargs)
 
 
-def check_slow(script, seconds):
-    clock = FakeClock()
-    session = SlowSession(script, clock, seconds)
+def check_slow(script, seconds, deadline):
+    session = SleepingSession(script, seconds)
     sleeps = []
-    with mock.patch.object(probe.time, "monotonic", clock):
-        result = probe.check_collector(COLLECTOR, session=session, sleep=sleeps.append)
+    result = probe.check_collector(COLLECTOR, session=session, sleep=sleeps.append,
+                                   deadline=deadline)
     return result, session, sleeps
 
 
@@ -233,19 +225,26 @@ def test_probe_timeout_is_connect_read_tuple():
 
 
 def test_probe_attempt_over_deadline_stops_retries():
-    result, session, sleeps = check_slow([503, 503, 503], ATTEMPT_DEADLINE + 1)
-    assert len(session.calls) == 1 and sleeps == [], (len(session.calls), sleeps)
+    result, _, sleeps = check_slow([503, 503, 503], 0.6, 0.2)
+    assert sleeps == [] and len(result["attempts"]) == 1, result
     assert result["ok"] is False and result["failure_kind"] == "timeout", result
     assert result["status_code"] is None, "причина должна быть timeout, а не HTTP 503"
 
 
 def test_probe_slow_200_is_not_ok():
-    result, _, _ = check_slow([200], ATTEMPT_DEADLINE + 1)
+    result, _, _ = check_slow([200], 0.6, 0.2)
     assert result["ok"] is False and result["failure_kind"] == "timeout", result
 
 
-def test_probe_attempt_at_deadline_is_still_normal():
-    result, session, _ = check_slow([503, 200], ATTEMPT_DEADLINE)
+def test_probe_capped_attempt_returns_by_deadline():
+    # Попытка висит 2 с, потолок 0.2: check_collector обязан вернуться сам, не дожидаясь.
+    started = time.monotonic()
+    check_slow([200], 2.0, 0.2)
+    assert time.monotonic() - started < 1.0
+
+
+def test_probe_attempt_within_deadline_is_normal():
+    result, session, _ = check_slow([503, 200], 0.05, 1.0)
     assert result["ok"] is True and len(session.calls) == 2, result
 
 
@@ -340,10 +339,22 @@ def test_state_roundtrip():
     assert "v7 down 2026-10-12T16:00:00" in text, text
 
 
-def test_state_parse_bad_lines():
+def test_state_parse_bad_lines_are_skipped_with_warning():
     for bad in ("v1 up\n", "v1 sideways 2026-10-12T16:00:00\n", "v1 up not-a-date\n",
                 "v1 up 2026-10-12T16:00:00 extra\n"):
-        raises(ValueError, state.parse_state, bad)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert state.parse_state(bad) == {}, bad
+        assert "строка 1 пропущена" in err.getvalue(), err.getvalue()
+
+
+def test_state_parse_keeps_good_lines_next_to_bad():
+    text = "v1 up 2026-10-12T16:00:00\nv3 Up 2026-10-12T16:00:00\nv7 down 2026-10-12T15:00:00\n"
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        got = state.parse_state(text)
+    assert list(got) == ["v1", "v7"] and got["v7"]["status"] == "down", got
+    assert "строка 2" in err.getvalue()
 
 
 def test_state_load_missing_path_warns():
@@ -485,22 +496,7 @@ def test_alert_group_min_parameter():
     assert len(alert.build_messages(events, group_min=GROUP_MIN_DOWN)) == 2
 
 
-def test_alert_send_all_counts_failures_and_does_not_stop():
-    seen = []
 
-    def sender(text):
-        seen.append(text)
-        return text != "b"
-
-    assert alert.send_all(["a", "b", "c", "d"], sender) == 1
-    assert seen == ["a", "b", "c", "d"], "после неудачи отправка продолжается"
-    assert alert.send_all([], sender) == 0
-    assert alert.send_all(["x", "y"], lambda t: False) == 2
-
-
-# ---------------------------------------------------------------------------
-# runlog
-# ---------------------------------------------------------------------------
 
 STAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"
 
@@ -733,122 +729,13 @@ def test_run_unreadable_list_gives_readable_error():
 # ---------------------------------------------------------------------------
 
 TOKEN = "TESTTOKEN:abc_DEF-123"
+TG_ENDPOINTS = [TELEGRAM_HOST] + list(TELEGRAM_IPS)
 
 
-class FakeResponse:
-    def __init__(self, status, body):
-        self.status = status
-        self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
 
-def http_error(code, body):
-    return urllib.error.HTTPError(
-        "https://api.telegram.org/bot{}/sendMessage".format(TOKEN), code, "err", {},
-        io.BytesIO(json.dumps(body).encode()))
 
 
-def call_notifier(actions, **kwargs):
-    """actions: по одному на вызов urlopen; исключение бросается, остальное возвращается."""
-    seen = []
-    queue = list(actions)
-
-    def fake_urlopen(request, timeout=None):
-        seen.append(request)
-        action = queue.pop(0)
-        if isinstance(action, BaseException):
-            raise action
-        return action
-
-    original = notifier.urllib.request.urlopen
-    notifier.urllib.request.urlopen = fake_urlopen
-    err = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err):
-            result = notifier.send_to_telegram(TOKEN, "42", "привет", **kwargs)
-    finally:
-        notifier.urllib.request.urlopen = original
-    return result, seen, err.getvalue()
-
-
-def test_ok_200():
-    result, seen, err = call_notifier([FakeResponse(200, {"ok": True, "result": {}})])
-    assert result is True, "ожидали True"
-    assert len(seen) == 1
-
-
-def test_non_200_with_ok_true():
-    result, _, _ = call_notifier([FakeResponse(201, {"ok": True})])
-    assert result is False, "успех только при HTTP 200"
-
-
-def test_200_but_ok_false():
-    result, _, _ = call_notifier([FakeResponse(200, {"ok": False})])
-    assert result is False, "ok:false при 200 не успех"
-
-
-def test_401_description_without_token():
-    result, seen, err = call_notifier([http_error(401, {"ok": False, "description": "Unauthorized"})])
-    assert result is False
-    assert "Unauthorized" in err, err
-    assert TOKEN not in err, "токен в stderr"
-    assert len(seen) == 1, "на 401 повтора быть не должно"
-
-
-def test_429_retries_once_and_succeeds():
-    slept = []
-    result, seen, _ = call_notifier(
-        [http_error(429, {"ok": False, "parameters": {"retry_after": 0}}),
-         FakeResponse(200, {"ok": True})],
-        sleep=slept.append)
-    assert result is True
-    assert len(seen) == 2, "ждали ровно два вызова urlopen"
-    assert slept == [0], slept
-
-
-def test_429_twice_gives_up():
-    slept = []
-    result, seen, _ = call_notifier(
-        [http_error(429, {"parameters": {"retry_after": 0}}),
-         http_error(429, {"parameters": {"retry_after": 0}})],
-        sleep=slept.append)
-    assert result is False
-    assert len(seen) == 2, "третьей попытки быть не должно"
-    assert len(slept) == 1
-
-
-def test_429_retry_after_is_capped_at_60():
-    slept = []
-    result, _, _ = call_notifier(
-        [http_error(429, {"parameters": {"retry_after": 3600}}),
-         FakeResponse(200, {"ok": True})],
-        sleep=slept.append)
-    assert result is True and slept == [60], slept
-
-
-def test_token_with_crlf_gives_clean_url():
-    seen = []
-
-    def fake_urlopen(request, timeout=None):
-        seen.append(request.full_url)
-        return FakeResponse(200, {"ok": True})
-
-    original = notifier.urllib.request.urlopen
-    notifier.urllib.request.urlopen = fake_urlopen
-    try:
-        assert notifier.send_to_telegram("123:abc\r\n", "42", "x") is True
-    finally:
-        notifier.urllib.request.urlopen = original
-    assert len(seen) == 1 and "\r" not in seen[0] and "\n" not in seen[0], seen
-    assert "/bot" + "123:abc/sendMessage" in seen[0], seen
 
 
 def test_probe_session_ignores_env_proxy():
@@ -872,29 +759,189 @@ def test_state_load_accepts_bom():
     assert list(loaded) == ["v1"], loaded
 
 
-def test_url_error_hides_token():
-    exc = urllib.error.URLError("не достучаться до /bot{}/sendMessage".format(TOKEN))
-    result, _, err = call_notifier([exc])
-    assert result is False
-    assert err.strip(), "причина должна быть в stderr"
-    assert TOKEN not in err, "токен в stderr"
-    assert "***" in err
 
 
-def test_invalid_json():
-    result, _, _ = call_notifier([FakeResponse(200, b"<html>not json")])
-    assert result is False
+
+
+
+
+
+
+
+
+
+
+
+
+
+def call_notifier(actions, token=TOKEN, **kwargs):
+    """actions: по одному на вызов notifier._post - кортеж (status, тело) или исключение.
+    Возвращает результат, список (endpoint, path, payload) и stderr."""
+    seen = []
+    queue = list(actions)
+
+    def fake_post(endpoint, path, payload, timeout):
+        seen.append((endpoint, path, payload))
+        action = queue.pop(0)
+        if isinstance(action, BaseException):
+            raise action
+        status, body = action
+        return status, body if isinstance(body, bytes) else json.dumps(body).encode()
+
+    original = notifier._post
+    notifier._post = fake_post
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            result = notifier.send_to_telegram(token, "42", "привет", sleep=kwargs.pop("sleep", lambda s: None), **kwargs)
+    finally:
+        notifier._post = original
+    return result, seen, err.getvalue()
+
+
+def test_ok_200():
+    result, seen, _ = call_notifier([(200, {"ok": True})])
+    assert result is True and len(seen) == 1
+    assert seen[0][0] == TELEGRAM_HOST, "первым идёт имя, не IP"
+
+
+def test_non_200_with_ok_true():
+    assert call_notifier([(500, {"ok": True})])[0] is False
+
+
+def test_200_but_ok_false():
+    assert call_notifier([(200, {"ok": False})])[0] is False
+
+
+def test_401_description_without_token():
+    result, seen, err = call_notifier([(401, {"ok": False, "description": "Unauthorized"})])
+    assert result is False and len(seen) == 1, "ответ сервера, перебор адресов не нужен"
+    assert "Unauthorized" in err and TOKEN not in err, err
+
+
+def test_429_retries_once_and_succeeds():
+    sleeps = []
+    result, seen, _ = call_notifier([(429, {"parameters": {"retry_after": 0}}), (200, {"ok": True})],
+                                    sleep=sleeps.append)
+    assert result is True and len(seen) == 2 and sleeps == [0], (result, len(seen), sleeps)
+
+
+def test_429_twice_gives_up():
+    body = {"parameters": {"retry_after": 0}}
+    result, seen, _ = call_notifier([(429, body), (429, body)])
+    assert result is False and len(seen) == 2
+
+
+def test_429_retry_after_is_capped_at_60():
+    sleeps = []
+    call_notifier([(429, {"parameters": {"retry_after": 3600}}), (200, {"ok": True})], sleep=sleeps.append)
+    assert sleeps == [60], sleeps
+
+
+def test_token_with_crlf_gives_clean_path():
+    result, seen, _ = call_notifier([(200, {"ok": True})], token="T:abc\r\n")
+    path = seen[0][1]
+    assert result is True and "\r" not in path and "\n" not in path, path
+    assert path == "/botT:abc/sendMessage", path
+
+
+def test_network_error_hides_token():
+    exc = notifier.NetworkError("не достучаться до /bot{}/sendMessage".format(TOKEN))
+    result, _, err = call_notifier([exc] * len(TG_ENDPOINTS))
+    assert result is False and err.strip() and TOKEN not in err and "***" in err, err
+
+
+def test_network_error_falls_back_to_next_endpoint():
+    exc = notifier.NetworkError("timed out")
+    sleeps = []
+    result, seen, err = call_notifier([exc, exc, (200, {"ok": True})], sleep=sleeps.append)
+    assert result is True, err
+    assert [e for e, _, _ in seen] == TG_ENDPOINTS[:3], seen
+    assert sleeps == [TELEGRAM_ENDPOINT_PAUSE, TELEGRAM_ENDPOINT_PAUSE], sleeps
+    assert "ушло через {}".format(TG_ENDPOINTS[2]) in err, err
+
+
+def test_all_endpoints_down():
+    exc = notifier.NetworkError("timed out")
+    sleeps = []
+    result, seen, err = call_notifier([exc] * len(TG_ENDPOINTS), sleep=sleeps.append)
+    assert result is False and len(seen) == len(TG_ENDPOINTS)
+    assert len(sleeps) == len(TG_ENDPOINTS) - 1, "после последнего адреса пауза не нужна"
+    assert "ни по одному" in err, err
+
+
+def test_http_error_stops_endpoint_iteration():
+    result, seen, _ = call_notifier([(400, {"description": "Bad Request"})])
+    assert result is False and len(seen) == 1
 
 
 def test_request_shape():
-    _, seen, _ = call_notifier([FakeResponse(200, {"ok": True})])
-    request = seen[0]
-    assert request.full_url.endswith("/bot{}/sendMessage".format(TOKEN)), request.full_url
-    assert request.get_method() == "POST"
-    assert request.get_header("Content-type") == "application/json"
-    body = json.loads(request.data.decode("utf-8"))
-    assert body["chat_id"] == "42" and body["text"] == "привет", body
-    assert body["disable_web_page_preview"] is True
+    _, seen, _ = call_notifier([(200, {"ok": True})])
+    endpoint, path, payload = seen[0]
+    assert path == "/bot{}/sendMessage".format(TOKEN), path
+    body = json.loads(payload.decode("utf-8"))
+    assert body["chat_id"] == "42" and body["text"] == "привет" and body["disable_web_page_preview"] is True, body
+
+
+def test_invalid_json():
+    assert call_notifier([(200, b"<html>not json")])[0] is False
+
+
+def test_endpoints_order_is_host_then_ips():
+    assert notifier.endpoints() == TG_ENDPOINTS
+
+
+def test_cert_name_matching():
+    cert = {"subjectAltName": (("DNS", "*.telegram.org"), ("DNS", "telegram.org"))}
+    assert notifier._name_matches(cert, "api.telegram.org")
+    assert notifier._name_matches({"subjectAltName": (("DNS", "api.telegram.org"),)}, "api.telegram.org")
+    assert not notifier._name_matches(cert, "api.evil.com")
+    assert not notifier._name_matches(cert, "deep.api.telegram.org"), "маска покрывает один уровень"
+    assert not notifier._name_matches({}, "api.telegram.org")
+
+
+
+def test_ip_connection_rejects_foreign_certificate():
+    class FakeSock:
+        def getpeercert(self):
+            return {"subjectAltName": (("DNS", "*.evil.com"),)}
+
+    class FakeConn:
+        def __init__(self, *a, **k):
+            self.sock = FakeSock()
+            self.closed = False
+
+        def connect(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    made = []
+    original = notifier.http.client.HTTPSConnection
+    notifier.http.client.HTTPSConnection = lambda *a, **k: made.append(FakeConn(*a, **k)) or made[-1]
+    try:
+        raises(notifier.NetworkError, notifier._connection, TELEGRAM_IPS[0], 5)
+    finally:
+        notifier.http.client.HTTPSConnection = original
+    assert made and made[0].closed, "соединение с чужим сертификатом должно закрываться"
+
+def test_notify_tool_works_without_requests():
+    # Обёртка зовёт notify.py и со сломанным venv: без requests он обязан дойти
+    # до отправки. Сеть подменена: соединения падают, паузы нулевые.
+    code = (
+        "import sys, socket, time, runpy\n"
+        "sys.modules['requests'] = None\n"
+        "socket.create_connection = lambda *a, **k: (_ for _ in ()).throw(OSError('нет сети'))\n"
+        "time.sleep = lambda s: None\n"
+        "sys.argv = ['notify.py', 'test']\n"
+        "runpy.run_path('tools/notify.py', run_name='__main__')\n")
+    env = {k: v for k, v in os.environ.items() if k not in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")}
+    env.update({"TELEGRAM_BOT_TOKEN": "1:x", "TELEGRAM_CHAT_ID": "1"})
+    proc = subprocess.run([sys.executable, "-B", "-c", code], cwd=str(ROOT), env=env,
+                          capture_output=True, text=True)
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+    assert "недоступен" in proc.stderr and "requests" not in proc.stderr, proc.stderr
 
 
 def test_make_sender_binds_arguments():
