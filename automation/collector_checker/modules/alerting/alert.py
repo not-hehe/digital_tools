@@ -1,4 +1,4 @@
-"""Тексты сообщений по правилам заказчика и отправка списка."""
+"""Тексты сообщений и отправка списка."""
 
 from typing import Callable, List, Optional
 
@@ -10,12 +10,10 @@ UP_MARK = "\U0001F7E2"     # зелёный кружок
 
 
 def build_batches(events: List[dict], group_min: Optional[int] = None) -> List[dict]:
-    """Сообщения с именами коллекторов, о которых они говорят: по именам
-    неотправленное сообщение возвращается в следующий прогон.
-
-    Сообщение уходит один раз на падение и один раз на подъём (Ваня, 2026-10-13);
-    still_down остаётся только в журнале. От group_min упавших или поднявшихся
-    в один прогон - одно сводное сообщение. Сначала падения, потом подъёмы."""
+    """Сообщения с именами коллекторов; по именам неотправленное повторяется в следующем
+    прогоне. Одно сообщение на падение и одно на подъём, still_down не сообщается.
+    От group_min событий за прогон формируется одно сообщение списком.
+    Сначала падения, затем подъёмы."""
     group_min = GROUP_MIN_DOWN if group_min is None else group_min
     down = [e["name"] for e in events if e["event"] == EVENT_DOWN]
     up = [e["name"] for e in events if e["event"] == EVENT_UP]
@@ -37,13 +35,12 @@ def build_batches(events: List[dict], group_min: Optional[int] = None) -> List[d
 
 
 def build_messages(events: List[dict], group_min: Optional[int] = None) -> List[str]:
-    # Только тексты: удобно в тестах, в прогоне нужны пакеты с именами.
+    # Только тексты, для тестов.
     return [b["text"] for b in build_batches(events, group_min)]
 
 
 def send_batches(batches: List[dict], sender: Callable[[str], bool]) -> List[str]:
-    """Имена коллекторов из неотправленных сообщений. После неудачи
-    не останавливается: сообщения независимы."""
+    """Имена из неотправленных сообщений. Перебор не прерывается после неудачи."""
     unsent = []
     for batch in batches:
         if not sender(batch["text"]):

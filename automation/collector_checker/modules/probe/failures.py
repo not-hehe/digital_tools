@@ -1,4 +1,4 @@
-"""Вид отказа по исключению requests. Нужен только журналу: в алерте причины нет."""
+"""Вид отказа по исключению requests, только для журнала."""
 
 import requests
 
@@ -8,8 +8,7 @@ FAIL_TIMEOUT = "timeout"
 FAIL_CONNECTION = "connection"
 FAIL_OTHER = "other"
 
-# socket.gaierror формулируется по-разному в Linux и macOS, requests доносит
-# текст целиком.
+# Текст DNS-ошибки разный на Linux и macOS.
 _DNS_MARKERS = (
     "name or service not known",
     "nodename nor servname",
@@ -20,8 +19,7 @@ _DNS_MARKERS = (
 
 
 def classify_exception(exc: BaseException) -> str:
-    # SSLError и ConnectTimeout наследуются от ConnectionError, поэтому
-    # ConnectionError проверяется последним.
+    # SSLError и ConnectTimeout наследуются от ConnectionError, он проверяется последним.
     if isinstance(exc, requests.exceptions.SSLError):
         return FAIL_TLS
     if isinstance(exc, requests.exceptions.Timeout):

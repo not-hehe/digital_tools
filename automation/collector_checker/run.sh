@@ -1,22 +1,14 @@
-#!/bin/bash
-# Обёртка для расписания: один прогон collector_checker с записью вывода
-# в суточный лог. Строка для cron:
-#
-#   0 * * * * /path/to/collector_checker/run.sh > /dev/null 2>&1
-#
-# Перенаправление нужно: вывод и так ложится в logs/, а без него cron слал бы
-# его почтой каждый час. Аргументы пробрасываются в main.py: ./run.sh --no-notify
-#
-# Если прогон завершился ошибкой или не смог стартовать (нет python, нет прав
-# на data/), обёртка сама сообщает об этом в Telegram: упавший прогон не может
-# отправить сообщение о собственном падении. Чего обёртка не ловит: cron, который
-# не вызвал её вовсе. Это видно только по пропавшим строкам в data/runs.log.
+ #!/bin/bash
+# Запуск одного прогона из cron:  0 * * * * /path/to/collector_checker/run.sh > /dev/null 2>&1
+# Вывод пишется в logs/; перенаправление отключает почту cron.
+# Аргументы передаются в main.py: ./run.sh --no-notify
+# При ошибке прогона или невозможности запуска отправляет сообщение в Telegram.
+# Пропущенный cron-ом запуск не отслеживается; его видно по пропуску в data/runs.log.
 set -uo pipefail
 
 cd "$(dirname "$0")" || exit 1
 
-# Секреты живут в .env рядом со скриптом: в crontab они попали бы в вывод ps.
-# set -a экспортирует всё объявленное в файле, чтобы python это увидел.
+# Секреты берутся из .env: crontab виден в ps всем пользователям.
 if [ -f .env ]; then
     set -a
     # shellcheck disable=SC1091
@@ -28,6 +20,10 @@ PYTHON="venv/bin/python"
 if [ ! -x "$PYTHON" ]; then
     PYTHON="$(command -v python3 || true)"
 fi
+# Под cron локаль бывает пустой, а в выводе кириллица.
+export PYTHONUTF8=1
+# urllib3 на macOS предупреждает про LibreSSL в каждом прогоне; к делу не относится.
+export PYTHONWARNINGS="ignore:urllib3 v2 only supports OpenSSL"
 
 LOG_FILE="logs/collector_checker_$(date +%Y-%m-%d).log"
 
@@ -35,18 +31,17 @@ log() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" >&2
 }
 
-# Отправка сообщения о сбое. Сначала через notify.py, а если python нет или он
-# сам упал - через curl прямо отсюда: иначе падение окружения осталось бы немым.
+# Отправка сообщения о сбое: notify.py, при недоступном python curl.
 alert() {
     local text="$1"
     if [ -n "$PYTHON" ] && "$PYTHON" tools/notify.py "$text" 2>&1 | while IFS= read -r l; do log "$l"; done; then
         return 0
     fi
     if command -v curl >/dev/null && [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        # -f: без него 401 от Telegram выглядел бы как успех. tr: .env с CRLF.
         local token chat
         token="$(printf '%s' "$TELEGRAM_BOT_TOKEN" | tr -d '\r ')"
         chat="$(printf '%s' "$TELEGRAM_CHAT_ID" | tr -d '\r ')"
+        # -f: ответ 401 считается ошибкой.
         if curl -sSf -m 15 -o /dev/null "https://api.telegram.org/bot${token}/sendMessage" \
                 --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" 2>/dev/null; then
             log "сообщение о сбое ушло через curl"
@@ -71,11 +66,8 @@ if [ -z "$PYTHON" ]; then
     fail_start "python не найден: ни venv/bin/python, ни python3 в PATH"
 fi
 
-# Два прогона разом (cron и ручной запуск в ту же минуту) пишут одно состояние
-# через один временный файл и шлют сообщения дважды. mkdir атомарен на обеих ОС,
-# flock на macOS нет. В локе лежит pid подоболочки с самим прогоном: лок, переживший
-# перезагрузку, иначе глушил бы все прогоны навсегда, и снаружи это ничем
-# не отличалось бы от нормы. ps вместо kill -0: чужой pid даёт kill-у EPERM.
+# Лок через каталог: mkdir атомарен и есть на macOS и Linux.
+# В каталоге лежит pid прогона; если процесс мёртв, лок считается протухшим.
 alive() {
     if command -v ps >/dev/null; then
         ps -p "$1" >/dev/null 2>&1
@@ -96,9 +88,8 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     mkdir "$LOCK_DIR" || fail_start "не удалось создать лок $LOCK_DIR"
 fi
 
-# Вывод этого прогона отдельно от суточного лога: суточный дописывается
-# и в нём хвост может принадлежать прошлым прогонам. mktemp ведёт себя по-разному:
-# macOS принимает голое имя с -t, GNU mktemp требует шаблон с XXXXXX.
+# Вывод текущего прогона хранится отдельно: в сообщение о сбое попадает его хвост.
+# Аргументы mktemp различаются на macOS и Linux.
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
     RUN_OUT="$(mktemp -t collector-checker)"
@@ -113,12 +104,8 @@ if [ -z "$RUN_OUT" ]; then
 fi
 trap 'rm -rf "$LOCK_DIR"; [ "$RUN_OUT" != "/dev/null" ] && rm -f "$RUN_OUT"' EXIT
 
-# Прогон идёт в фоновой подоболочке, а обёртка ждёт её: bash не обрабатывает
-# сигналы, пока ждёт конвейер на переднем плане, и kill по pid обёртки оставлял
-# python сиротой без лока. Лок держит pid подоболочки, он жив ровно столько,
-# сколько прогон. Конвейер вместо exec > >(...): при exec последние строки
-# терялись. Метки времени ставит цикл read, -u нужен, чтобы они стояли
-# в момент события, а не сброса буфера.
+# Прогон в фоновой подоболочке: сигнал обёртке останавливает и python.
+# -u: вывод без буферизации, метки времени соответствуют событиям.
 (
     "$PYTHON" -u main.py "$@" 2>&1 \
         | while IFS= read -r line || [ -n "$line" ]; do
@@ -128,19 +115,16 @@ trap 'rm -rf "$LOCK_DIR"; [ "$RUN_OUT" != "/dev/null" ] && rm -f "$RUN_OUT"' EXI
 ) &
 SUB=$!
 echo "$SUB" > "$LOCK_DIR/pid"
-# По TERM/INT гасим весь прогон, а не только обёртку. pkill есть на macOS и в procps.
 trap 'log "получен сигнал, останавливаю прогон"; pkill -TERM -P "$SUB" 2>/dev/null; kill -TERM "$SUB" 2>/dev/null; exit 143' TERM INT
 wait "$SUB"
 CODE=$?
 trap - TERM INT
 
-# Код 2 это ошибка в аргументах, то есть человек в терминале: он её видит сам.
-# Недоставленные сообщения кода 1 не дают: это сбой канала, main.py вернёт их
-# в следующий прогон, а сообщать о недоступном Telegram через Telegram бессмысленно.
+# Код 2 (ошибка аргументов) не оповещается. Недоставка в Telegram кода 1 не даёт.
 if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
     alert "$(printf 'Прогон collector_checker завершился ошибкой (код %s): список не загружен, состояние не сохранено или python упал\nВремя: %s\n\nПоследние строки лога:\n%s' \
         "$CODE" "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
-        "$(grep -vE "NotOpenSSLWarning|warnings.warn" "$RUN_OUT" | tail -n 10)")"
+        "$(tail -n 10 "$RUN_OUT")")"
 fi
 
 exit "$CODE"
