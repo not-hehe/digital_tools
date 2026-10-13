@@ -176,7 +176,7 @@ def test_ac1_all_ok_first_run():
 def test_ac2_one_down():
     r = run_case({"v7": 503}, state_text=state_text_all_up_except(None, an_hour_ago()))
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == ["Обнаружено падение, v7"], sent(r["out"])
+    assert sent(r["out"]) == ["🔴 Обнаружено падение, v7"], sent(r["out"])
     assert r["state"]["v7"][0] == "down"
     assert all(r["state"][n][0] == "up" for n in NAMES if n != "v7")
     assert "event down v7" in r["runlog"], r["runlog"]
@@ -184,11 +184,12 @@ def test_ac2_one_down():
     assert r["state"]["v7"][1] > an_hour_ago() + timedelta(minutes=30), r["state"]["v7"]
 
 
-def test_ac3_still_down_repeats_message():
+def test_ac3_still_down_is_silent():
     since = an_hour_ago()
     r = run_case({"v7": 503}, state_text=state_text_all_up_except("v7", since))
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == ["Обнаружено падение, v7"], sent(r["out"])
+    assert sent(r["out"]) == [], sent(r["out"])
+    assert "Сообщать не о чем." in r["out"], r["out"]
     assert r["state"]["v7"] == ("down", since), r["state"]["v7"]
     assert "event still_down v7" in r["runlog"], r["runlog"]
     assert "event down v7" not in r["runlog"]
@@ -197,7 +198,7 @@ def test_ac3_still_down_repeats_message():
 def test_ac4_recovery():
     r = run_case({}, state_text=state_text_all_up_except("v7", an_hour_ago()))
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == ["Коллектор v7 снова работает"], sent(r["out"])
+    assert sent(r["out"]) == ["🟢 Коллектор v7 снова работает"], sent(r["out"])
     assert r["state"]["v7"][0] == "up"
     assert r["state"]["v7"][1] > an_hour_ago() + timedelta(minutes=30), r["state"]["v7"]
     assert "event up v7" in r["runlog"], r["runlog"]
@@ -206,11 +207,11 @@ def test_ac4_recovery():
 def test_ac5_group_message_from_three():
     r = run_case({"v1": 503, "v3": 503, "v7": 503})
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == ["Обнаружено падение: v1, v3, v7"], sent(r["out"])
+    assert sent(r["out"]) == ["🔴 Обнаружено падение: v1, v3, v7"], sent(r["out"])
     assert [n for n, (s, _) in r["state"].items() if s == "down"] == ["v1", "v3", "v7"]
 
     r = run_case({"v1": 503, "v7": 503})
-    assert sent(r["out"]) == ["Обнаружено падение, v1", "Обнаружено падение, v7"], sent(r["out"])
+    assert sent(r["out"]) == ["🔴 Обнаружено падение, v1", "🔴 Обнаружено падение, v7"], sent(r["out"])
     assert not any("падение:" in m for m in sent(r["out"]))
 
 
@@ -231,7 +232,7 @@ def test_ac7_connection_refused_and_timeout():
     r = run_case({"v5": "hang"}, overrides={"v4": dead})
     assert time.monotonic() - started < 15
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == ["Обнаружено падение, v4", "Обнаружено падение, v5"], sent(r["out"])
+    assert sent(r["out"]) == ["🔴 Обнаружено падение, v4", "🔴 Обнаружено падение, v5"], sent(r["out"])
     assert r["state"]["v4"][0] == "down" and r["state"]["v5"][0] == "down"
     run_line = [l for l in r["runlog"].splitlines() if " run " in l][0]
     assert "v4 connection (3 попытки)" in run_line, run_line
@@ -257,7 +258,7 @@ def test_unsaveable_state_still_sends_message():
 
     r = run_case({"v7": 503}, state_path=inside_a_file)
     assert r["code"] == 1
-    assert sent(r["out"]) == ["Обнаружено падение, v7"], sent(r["out"])
+    assert sent(r["out"]) == ["🔴 Обнаружено падение, v7"], sent(r["out"])
     assert "состояние не сохранено" in r["err"], r["err"]
     assert not r["state_exists"]
 

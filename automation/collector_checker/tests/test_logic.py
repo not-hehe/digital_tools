@@ -406,40 +406,47 @@ def test_alert_no_events():
 
 
 def test_alert_one_down():
-    assert alert.build_messages([ev("down", "v7")]) == ["Обнаружено падение, v7"]
+    assert alert.build_messages([ev("down", "v7")]) == ["🔴 Обнаружено падение, v7"]
 
 
 def test_alert_two_down_are_separate():
-    got = alert.build_messages([ev("down", "v1"), ev("still_down", "v7")])
-    assert got == ["Обнаружено падение, v1", "Обнаружено падение, v7"], got
+    got = alert.build_messages([ev("down", "v1"), ev("down", "v7")])
+    assert got == ["🔴 Обнаружено падение, v1", "🔴 Обнаружено падение, v7"], got
 
 
 def test_alert_three_down_grouped_in_input_order():
-    events = [ev("down", "v1"), ev("still_down", "v3"), ev("down", "v7")]
-    assert alert.build_messages(events) == ["Обнаружено падение: v1, v3, v7"]
+    events = [ev("down", "v1"), ev("down", "v3"), ev("down", "v7")]
+    assert alert.build_messages(events) == ["🔴 Обнаружено падение: v1, v3, v7"]
 
 
-def test_alert_still_down_counts_toward_group():
+def test_alert_still_down_is_silent():
+    # Правило Вани 2026-10-13: про лежащий коллектор сообщаем один раз, не каждый час.
     events = [ev("still_down", "v1"), ev("still_down", "v2"), ev("still_down", "v3")]
-    assert alert.build_messages(events) == ["Обнаружено падение: v1, v2, v3"]
+    assert alert.build_messages(events) == []
+    assert alert.build_messages([ev("still_down", "v3"), ev("down", "v7")]) == ["🔴 Обнаружено падение, v7"]
+
+
+def test_alert_marks_in_texts():
+    assert alert.build_messages([ev("down", "v7")])[0].startswith(alert.DOWN_MARK + " ")
+    assert alert.build_messages([ev("up", "v7")])[0].startswith(alert.UP_MARK + " ")
 
 
 def test_alert_up_message_after_downs():
     events = [ev("up", "v2"), ev("down", "v7")]
-    assert alert.build_messages(events) == ["Обнаружено падение, v7",
-                                            "Коллектор v2 снова работает"]
+    assert alert.build_messages(events) == ["🔴 Обнаружено падение, v7",
+                                            "🟢 Коллектор v2 снова работает"]
 
 
 def test_alert_ups_are_never_grouped():
     events = [ev("up", "v1"), ev("up", "v2"), ev("up", "v3")]
-    assert alert.build_messages(events) == ["Коллектор v1 снова работает",
-                                            "Коллектор v2 снова работает",
-                                            "Коллектор v3 снова работает"]
+    assert alert.build_messages(events) == ["🟢 Коллектор v1 снова работает",
+                                            "🟢 Коллектор v2 снова работает",
+                                            "🟢 Коллектор v3 снова работает"]
 
 
 def test_alert_group_min_parameter():
     events = [ev("down", "v1"), ev("down", "v2")]
-    assert alert.build_messages(events, group_min=2) == ["Обнаружено падение: v1, v2"]
+    assert alert.build_messages(events, group_min=2) == ["🔴 Обнаружено падение: v1, v2"]
     assert len(alert.build_messages(events, group_min=GROUP_MIN_DOWN)) == 2
 
 
