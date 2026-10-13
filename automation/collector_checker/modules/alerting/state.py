@@ -1,10 +1,5 @@
-"""Состояние между прогонами: текстовый файл, строка на коллектор.
-
-    v1 up 2026-10-12T16:00:05
-    v7 down 2026-10-12T15:00:03
-
-Нечитаемый файл это первый запуск, незаписанный роняет прогон кодом 1: без
-памяти чекер перестаёт отличать "упал" от "лежит" и теряет сообщение о подъёме.
+"""Состояние между прогонами: строка на коллектор, `v7 down 2026-10-12T15:00:03`.
+Отсутствующий файл считается первым запуском; ошибка записи завершает прогон кодом 1.
 """
 
 import os
@@ -27,9 +22,7 @@ _HEADER = "# collector status since(MSK)"
 
 
 def parse_state(text: str) -> Dict[str, dict]:
-    """Битая строка пропускается с предупреждением, остальные живут: обнулять всё
-    из-за одной опечатки значило бы потерять сообщения о подъёме всех лежащих.
-    Коллектор без записи считается живым, и если он лежит, падение придёт снова."""
+    """Некорректная строка пропускается с предупреждением."""
     state = {}
     for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -68,8 +61,7 @@ def render_state(state: Dict[str, dict]) -> str:
 
 
 def save_state(state: Dict[str, dict], path: Optional[Path] = None) -> bool:
-    """Через временный файл: обрезанный state.txt после сбоя посреди записи
-    на следующем прогоне выглядел бы как первый запуск."""
+    """Запись через временный файл: сбой посреди записи не портит state.txt."""
     path = STATE_FILE if path is None else Path(path)
     tmp = str(path) + ".tmp"
     try:
@@ -85,7 +77,7 @@ def save_state(state: Dict[str, dict], path: Optional[Path] = None) -> bool:
 
 def apply_results(state: Dict[str, dict], results: List[dict],
                   now: Optional[datetime] = None) -> Tuple[Dict[str, dict], List[dict]]:
-    """Новое состояние только по проверенным коллекторам и события к отправке."""
+    """Новое состояние по проверенным коллекторам и события."""
     now = now_msk() if now is None else now
     new_state = {}
     events = []
@@ -110,9 +102,8 @@ def apply_results(state: Dict[str, dict], results: List[dict],
 
 def keep_unreported(new_state: Dict[str, dict], old_state: Dict[str, dict],
                     names: List[str]) -> Dict[str, dict]:
-    """Откатывает коллекторы, о которых сообщение не ушло, к прошлому статусу:
-    следующий прогон увидит ту же смену и отправит его снова. Иначе сообщение
-    терялось бы навсегда, а состояние уже считало его сообщённым."""
+    """Коллекторы с неотправленным сообщением возвращаются к прошлому статусу;
+    следующий прогон отправит его снова."""
     result = dict(new_state)
     for name in names:
         if name in old_state:

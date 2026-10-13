@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Отправить готовый текст в Telegram. Нужен обёртке run.sh.
+"""Отправка готового текста в Telegram; используется run.sh для сообщений о сбое прогона.
 
     venv/bin/python tools/notify.py "текст"
     echo "текст" | venv/bin/python tools/notify.py
 
-Зачем отдельно от main.py: сообщение о том, что прогон НЕ состоялся, не может
-отправлять сам прогон, он в этот момент уже упал. Отправляет тот, кто его запускал.
-
-Секреты не заданы: пишем в stderr и выходим нулём, обёртка не должна падать
-из-за ненастроенной отправки. Отправка не удалась: код 1.
+Без секретов: код 0 и строка в stderr. Ошибка отправки: код 1.
 """
 
 import importlib.util
@@ -23,8 +19,7 @@ from modules.config import TELEGRAM_CHAT_VAR, TELEGRAM_TOKEN_VAR  # noqa: E402
 
 
 def _load_notifier():
-    # По пути, а не через пакет alerting: пакет тянет requests, а здесь venv может
-    # быть сломан, и тогда сообщение о сбое ушло бы в никуда.
+    # Загрузка по пути, минуя пакет alerting с зависимостью от requests.
     spec = importlib.util.spec_from_file_location(
         "collector_notifier", ROOT / "modules" / "alerting" / "notifier.py")
     module = importlib.util.module_from_spec(spec)

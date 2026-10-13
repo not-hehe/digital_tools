@@ -14,3 +14,5 @@ v12 https://collector.example.com/com.google.analytics/v12
 v13 https://collector.example.com/com.google.analytics/v13
 v14 https://collector.example.com/com.google.analytics/v14
 v15 https://collector.example.com/com.google.analytics/v15
+# Третья колонка: допустимые коды. Пиксель без параметров отвечает 404, ничего не записывая.
+v16 https://collector.example.com/com.google.analytics/v16/i 200,404

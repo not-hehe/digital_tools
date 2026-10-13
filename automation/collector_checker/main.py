@@ -36,11 +36,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 def choose_sender(no_notify: bool) -> Optional[Callable[[str], bool]]:
-    """None, если отправка нужна, а секретов нет: об этом надо узнать до того,
-    как час прогона потрачен на запросы."""
+    """None, если отправка включена, а секреты не заданы; проверяется до запросов."""
     if no_notify:
         return printing_sender
-    # strip: .env с CRLF оставляет \r в значении, и токен с ним попадал бы в текст ошибки urllib.
+    # strip: .env с CRLF оставляет \r в значениях.
     values = {name: (os.environ.get(name) or "").strip()
               for name in (TELEGRAM_TOKEN_VAR, TELEGRAM_CHAT_VAR)}
     missing = [name for name, value in values.items() if not value]
@@ -62,14 +61,12 @@ def run(args: argparse.Namespace) -> int:
         print("список не загружен: {}".format(e), file=sys.stderr)
         return 1
     except UnicodeDecodeError as e:
-        # Сырой текст исключения про байты и позиции оператору ничего не говорит.
         print("список не загружен: файл не в UTF-8 ({}), сохраните его в UTF-8".format(
             e.reason), file=sys.stderr)
         return 1
 
     previous = load_state(args.state)
-    # Строки по коллекторам появятся только после всех попыток: без этой
-    # подсказки молчание на неотвечающем шлюзе выглядит как зависание.
+    # Результаты печатаются после всех попыток; строка показывает, что прогон идёт.
     print("Проверяю {} коллекторов, при неответе до {} с...".format(
         len(collectors), ATTEMPTS * REQUEST_TIMEOUT + (ATTEMPTS - 1) * RETRY_PAUSE), flush=True)
     results = check_all(collectors)
@@ -86,8 +83,7 @@ def run(args: argparse.Namespace) -> int:
         print("Сообщать не о чем.")
     lines = [run_line(results)] + event_lines(events)
     if unsent:
-        # Недоставленное не теряем: статус откатывается, следующий прогон отправит
-        # снова. Это сбой канала, а не скрипта, поэтому код возврата остаётся 0.
+        # Недоставленное отправится в следующем прогоне. Сбой канала не даёт код 1.
         state = keep_unreported(state, previous, unsent)
         lines.append(unsent_line(unsent))
         print("не отправлено: {}; повтор в следующем прогоне".format(", ".join(unsent)),

@@ -64,9 +64,18 @@ def test_sources_one_field():
     assert "строка 2" in str(e), str(e)
 
 
-def test_sources_three_fields():
+def test_sources_third_field_must_be_codes():
     e = raises(sources.BadCollectorLine, sources.parse_collectors, "# c\nv1 https://a/1 лишнее\n")
     assert "строка 2" in str(e), str(e)
+    raises(sources.BadCollectorLine, sources.parse_collectors, "v1 https://a/1 200,abc\n")
+    raises(sources.BadCollectorLine, sources.parse_collectors, "v1 https://a/1 999\n")
+    raises(sources.BadCollectorLine, sources.parse_collectors, "v1 https://a/1 200 404\n")
+
+
+def test_sources_third_field_sets_healthy_codes():
+    got = sources.parse_collectors("v1 https://a/1\nv16 https://a/v16/i 404,200\n")
+    assert "healthy" not in got[0], "без колонки правило общее"
+    assert got[1] == {"name": "v16", "url": "https://a/v16/i", "healthy": (200, 404)}, got[1]
 
 
 def test_sources_url_without_scheme():
@@ -151,6 +160,18 @@ def test_probe_200_first_try():
     assert session.responses[0].closed, "ответ должен закрываться без чтения тела"
     kwargs = session.calls[0][1]
     assert kwargs["allow_redirects"] is False and kwargs["stream"] is True, kwargs
+
+
+def test_probe_target_specific_codes():
+    pixel = {"name": "v16", "url": "https://h/v16/i", "healthy": (200, 404)}
+    session = ProbeSession([404])
+    result = probe.check_collector(pixel, session=session, sleep=lambda s: None)
+    assert result["ok"] is True and len(session.calls) == 1, result
+    session = ProbeSession([500, 500, 500])
+    result = probe.check_collector(pixel, session=session, sleep=lambda s: None)
+    assert result["ok"] is False and len(session.calls) == 3, result
+    result, _, _ = check([404, 404, 404])
+    assert result["ok"] is False, "без колонки 404 это падение"
 
 
 def test_probe_503_then_200():
@@ -729,7 +750,7 @@ def test_run_unreadable_list_gives_readable_error():
 # ---------------------------------------------------------------------------
 
 TOKEN = "TESTTOKEN:abc_DEF-123"
-TG_ENDPOINTS = [TELEGRAM_HOST] + list(TELEGRAM_IPS)
+TG_ENDPOINTS = list(TELEGRAM_IPS) + [TELEGRAM_HOST]
 
 
 
@@ -741,6 +762,12 @@ TG_ENDPOINTS = [TELEGRAM_HOST] + list(TELEGRAM_IPS)
 def test_probe_session_ignores_env_proxy():
     with probe._new_session() as session:
         assert session.trust_env is False
+
+
+def test_sources_accepts_url_with_query():
+    # Пиксель v16/i отвечает 200 только с параметрами, они живут прямо в адресе.
+    got = sources.parse_collectors("v16 https://h/v16/i?t=event&dl=collector-checker\n")
+    assert got == [{"name": "v16", "url": "https://h/v16/i?t=event&dl=collector-checker"}], got
 
 
 def test_sources_load_collectors_accepts_bom():
@@ -802,7 +829,7 @@ def call_notifier(actions, token=TOKEN, **kwargs):
 def test_ok_200():
     result, seen, _ = call_notifier([(200, {"ok": True})])
     assert result is True and len(seen) == 1
-    assert seen[0][0] == TELEGRAM_HOST, "первым идёт имя, не IP"
+    assert seen[0][0] == TELEGRAM_IPS[0], "первым идёт IP, как у коллег"
 
 
 def test_non_200_with_ok_true():
@@ -925,6 +952,26 @@ def test_ip_connection_rejects_foreign_certificate():
     finally:
         notifier.http.client.HTTPSConnection = original
     assert made and made[0].closed, "соединение с чужим сертификатом должно закрываться"
+
+
+def test_ip_connection_accepts_anything_when_verify_off():
+    class FakeConn:
+        def __init__(self, *a, **k):
+            self.sock = type("S", (), {"getpeercert": lambda self: {"subjectAltName": (("DNS", "*.evil.com"),)}})()
+            self.context = k.get("context")
+
+        def connect(self):
+            pass
+
+    made = []
+    original_conn, original_flag = notifier.http.client.HTTPSConnection, notifier.TELEGRAM_VERIFY_CERT
+    notifier.http.client.HTTPSConnection = lambda *a, **k: made.append(FakeConn(*a, **k)) or made[-1]
+    notifier.TELEGRAM_VERIFY_CERT = False
+    try:
+        conn = notifier._connection(TELEGRAM_IPS[0], 5)
+    finally:
+        notifier.http.client.HTTPSConnection, notifier.TELEGRAM_VERIFY_CERT = original_conn, original_flag
+    assert conn is made[0] and conn.context.verify_mode == notifier.ssl.CERT_NONE
 
 def test_notify_tool_works_without_requests():
     # Обёртка зовёт notify.py и со сломанным venv: без requests он обязан дойти

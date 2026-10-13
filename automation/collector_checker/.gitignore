@@ -1,0 +1,20 @@
+# Секреты: токен бота и chat id. Пример с именами переменных лежит в .env.example.
+.env
+
+# Рабочие данные: список коллекторов (образец в collectors.example.txt), состояние, журнал.
+data/collectors.txt
+data/state.txt
+data/state.txt.tmp
+data/runs.log
+data/.run.lock/
+logs/
+
+# Окружение и кэш Python
+venv/
+__pycache__/
+*.py[cod]
+
+# Внутренняя документация разработки.
+docs/
+
+.DS_Store

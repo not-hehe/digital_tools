@@ -16,8 +16,7 @@ from .failures import FAIL_OTHER, FAIL_TIMEOUT, classify_exception
 def _new_session() -> requests.Session:
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
-    # Прокси из окружения, если его зададут ради Telegram, увёл бы и проверки
-    # коллекторов за рубеж, а оттуда они не отвечают (S-02). Коллекторы всегда напрямую.
+    # Прокси из окружения не используется: коллекторы доступны только напрямую.
     session.trust_env = False
     return session
 
@@ -25,9 +24,7 @@ def _new_session() -> requests.Session:
 def _attempt(session: requests.Session, url: str, timeout: int) -> dict:
     started = time.monotonic()
     try:
-        # stream=True и close(): нужен код, а не gif-пиксель в теле. Таймаут кортежем:
-        # отдельно на соединение и на ожидание байтов, одно число requests трактует так же,
-        # но явная пара не даёт перепутать его с потолком всей попытки (ATTEMPT_DEADLINE).
+        # stream=True: нужен только код ответа. Таймаут на соединение и на ожидание байтов.
         response = session.get(url, timeout=(timeout, timeout), allow_redirects=False, stream=True)
         response.close()
         return {"status_code": response.status_code, "failure_kind": None,
@@ -38,10 +35,8 @@ def _attempt(session: requests.Session, url: str, timeout: int) -> dict:
 
 
 def _attempt_capped(session: requests.Session, url: str, timeout: int, deadline: float) -> dict:
-    """Попытка с жёстким потолком. Таймаут requests ограничивает паузу между байтами,
-    а не запрос целиком: сервер, отдающий заголовки по байту, тянул бы попытку
-    бесконечно. Попытка идёт в daemon-потоке; не уложилась - бросаем её и идём
-    дальше, при выходе процесса поток умрёт сам."""
+    """Попытка в отдельном потоке с пределом по времени: таймаут requests не ограничивает
+    запрос целиком. При превышении поток остаётся без ожидания."""
     box = queue.Queue(maxsize=1)
     worker = threading.Thread(target=lambda: box.put(_attempt(session, url, timeout)), daemon=True)
     worker.start()
@@ -57,12 +52,13 @@ def check_collector(collector: dict, *, timeout: Optional[int] = None,
                     attempts: Optional[int] = None, pause: Optional[float] = None,
                     deadline: Optional[float] = None, sleep=time.sleep,
                     session: Optional[requests.Session] = None) -> dict:
-    """Наружу исключений не поднимает. `sleep` параметром - чтобы тесты не ждали."""
+    """Исключений наружу не поднимает. sleep подменяется в тестах."""
     timeout = REQUEST_TIMEOUT if timeout is None else timeout
     attempts = ATTEMPTS if attempts is None else attempts
     pause = RETRY_PAUSE if pause is None else pause
     deadline = ATTEMPT_DEADLINE if deadline is None else deadline
 
+    healthy = tuple(collector.get("healthy") or (HEALTHY_CODE,))
     result = {"name": collector["name"], "url": collector["url"], "ok": False,
               "status_code": None, "failure_kind": None, "error": None,
               "attempts": [], "checked_at": now_msk()}
@@ -78,7 +74,7 @@ def check_collector(collector: dict, *, timeout: Optional[int] = None,
                            "error": attempt["error"]})
             if attempt.get("capped"):
                 break
-            if attempt["status_code"] == HEALTHY_CODE:
+            if attempt["status_code"] in healthy:
                 result["ok"] = True
                 break
             if number < attempts:
@@ -90,17 +86,17 @@ def check_collector(collector: dict, *, timeout: Optional[int] = None,
 
 
 def check_all(collectors: List[dict], max_workers: Optional[int] = None, **kwargs) -> List[dict]:
-    """Порядок результатов повторяет порядок конфига, а не порядок завершения."""
+    """Результаты в порядке конфига."""
     max_workers = MAX_WORKERS if max_workers is None else max_workers
     if not collectors:
         return []
 
     def run_one(collector):
-        # Сессия на задачу: requests.Session не потокобезопасна.
+        # Сессия на поток: Session не потокобезопасна.
         try:
             with _new_session() as session:
                 return check_collector(collector, session=session, **kwargs)
-        except Exception as e:  # сбой вне check_collector не должен ронять прогон
+        except Exception as e:  # ошибка одной цели не прерывает остальные
             return {"name": collector.get("name"), "url": collector.get("url"), "ok": False,
                     "status_code": None, "failure_kind": FAIL_OTHER, "error": str(e),
                     "attempts": [], "checked_at": now_msk()}
@@ -110,7 +106,7 @@ def check_all(collectors: List[dict], max_workers: Optional[int] = None, **kwarg
 
 
 def reason_of(result: dict) -> str:
-    # Для журнала и вывода прогона; в сообщения причина не попадает по правилу заказчика.
+    # Причина для журнала и вывода; в сообщения не попадает.
     if result.get("status_code") is not None:
         return "HTTP {}".format(result["status_code"])
     return result.get("failure_kind") or "причина не определена"

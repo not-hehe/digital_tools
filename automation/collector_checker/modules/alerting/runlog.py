@@ -22,8 +22,7 @@ def _attempts(r: dict) -> str:
 
 def run_line(results: List[dict]) -> str:
     failing = [r for r in results if not r["ok"]]
-    # Поднявшийся со второй попытки до сообщения не доходит, но моргание
-    # должно быть видно: по нему решают, что делать с порогами.
+    # Цели, ответившие не с первой попытки.
     flaky = [r for r in results if r["ok"] and len(r["attempts"]) > 1]
     line = "{} run checked={} down={}".format(
         now_msk().strftime(_FMT), len(results), len(failing))
@@ -43,7 +42,7 @@ def event_lines(events: List[dict]) -> List[str]:
 
 def append(lines: List[str], path: Optional[Path] = None,
            max_lines: Optional[int] = None) -> bool:
-    """False, если записать не удалось. Прогон это не роняет: история важна, проверка важнее."""
+    """False при ошибке записи; прогон продолжается."""
     path = RUNLOG_FILE if path is None else path
     max_lines = RUNLOG_MAX_LINES if max_lines is None else max_lines
     if not lines:
@@ -61,7 +60,7 @@ def append(lines: List[str], path: Optional[Path] = None,
 def _trim(path: Path, max_lines: int) -> None:
     if max_lines <= 0:
         return
-    # Люфт в 10%: иначе файл переписывался бы на каждом прогоне после заполнения.
+    # Запас, чтобы не переписывать файл на каждом прогоне.
     slack = max(1, max_lines // 10)
     try:
         with open(path, encoding="utf-8") as f:
@@ -75,6 +74,5 @@ def _trim(path: Path, max_lines: int) -> None:
 
 
 def unsent_line(names: List[str]) -> str:
-    # По этой строке в журнале видно, что сообщение задержалось, а не пропало.
     return "{} unsent {} (повтор в следующем прогоне)".format(
         now_msk().strftime(_FMT), ", ".join(names))
