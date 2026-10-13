@@ -207,7 +207,8 @@ def test_ac4_recovery():
 def test_ac5_group_message_from_three():
     r = run_case({"v1": 503, "v3": 503, "v7": 503})
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == ["🔴 Обнаружено падение: v1, v3, v7"], sent(r["out"])
+    assert sent(r["out"]) == ["🔴 Обнаружено падение:"], sent(r["out"])
+    assert "- Коллектор v1\n- Коллектор v3\n- Коллектор v7" in r["out"], r["out"]
     assert [n for n, (s, _) in r["state"].items() if s == "down"] == ["v1", "v3", "v7"]
 
     r = run_case({"v1": 503, "v7": 503})

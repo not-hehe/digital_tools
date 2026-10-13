@@ -1,13 +1,13 @@
-from .alert import build_messages, send_all
+from .alert import build_batches, build_messages, send_all, send_batches
 from .notifier import make_sender, printing_sender, send_to_telegram
 from .runlog import append as runlog_append
-from .runlog import attempts_word, event_lines, run_line
+from .runlog import attempts_word, event_lines, run_line, unsent_line
 from .state import (EVENT_DOWN, EVENT_STILL_DOWN, EVENT_UP, STATUS_DOWN,
                     STATUS_UP, apply_results, load_state, parse_state,
-                    render_state, save_state)
+                    render_state, save_state, keep_unreported)
 
-__all__ = ["build_messages", "send_all", "send_to_telegram", "make_sender",
+__all__ = ["build_batches", "build_messages", "send_all", "send_batches", "send_to_telegram", "make_sender",
            "printing_sender", "run_line", "event_lines", "runlog_append",
-           "attempts_word", "load_state", "save_state", "parse_state",
+           "attempts_word", "unsent_line", "keep_unreported", "load_state", "save_state", "parse_state",
            "render_state", "apply_results", "STATUS_UP", "STATUS_DOWN",
            "EVENT_DOWN", "EVENT_STILL_DOWN", "EVENT_UP"]

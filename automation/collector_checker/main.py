@@ -11,12 +11,12 @@ import os
 import sys
 from typing import Callable, List, Optional
 
-from modules.alerting import (apply_results, attempts_word, build_messages,
-                              event_lines, load_state, make_sender,
-                              printing_sender, run_line, runlog_append,
-                              save_state, send_all)
-from modules.config import (COLLECTORS_FILE, RUNLOG_FILE, STATE_FILE, TELEGRAM_CHAT_VAR,
-                            TELEGRAM_TOKEN_VAR)
+from modules.alerting import (apply_results, attempts_word, build_batches,
+                              event_lines, keep_unreported, load_state, make_sender,
+                              printing_sender, run_line, runlog_append, save_state,
+                              send_batches, unsent_line)
+from modules.config import (ATTEMPTS, COLLECTORS_FILE, REQUEST_TIMEOUT, RETRY_PAUSE,
+                            RUNLOG_FILE, STATE_FILE, TELEGRAM_CHAT_VAR, TELEGRAM_TOKEN_VAR)
 from modules.probe import check_all, reason_of
 from modules.sources import BadCollectorLine, EmptyCollectorList, load_collectors
 
@@ -67,7 +67,11 @@ def run(args: argparse.Namespace) -> int:
             e.reason), file=sys.stderr)
         return 1
 
-    state = load_state(args.state)
+    previous = load_state(args.state)
+    # Строки по коллекторам появятся только после всех попыток: без этой
+    # подсказки молчание на неотвечающем шлюзе выглядит как зависание.
+    print("Проверяю {} коллекторов, при неответе до {} с...".format(
+        len(collectors), ATTEMPTS * REQUEST_TIMEOUT + (ATTEMPTS - 1) * RETRY_PAUSE), flush=True)
     results = check_all(collectors)
     for r in results:
         print("{:<4} {:<5} {:<11} {} {}, {} мс".format(
@@ -75,22 +79,27 @@ def run(args: argparse.Namespace) -> int:
             len(r["attempts"]), attempts_word(len(r["attempts"])),
             r["attempts"][-1]["elapsed_ms"] if r["attempts"] else "-"))
 
-    state, events = apply_results(state, results)
-    messages = build_messages(events)
-    failed = send_all(messages, sender)
-    if not messages:
+    state, events = apply_results(previous, results)
+    batches = build_batches(events)
+    unsent = send_batches(batches, sender)
+    if not batches:
         print("Сообщать не о чем.")
+    lines = [run_line(results)] + event_lines(events)
+    if unsent:
+        # Недоставленное не теряем: статус откатывается, следующий прогон отправит
+        # снова. Это сбой канала, а не скрипта, поэтому код возврата остаётся 0.
+        state = keep_unreported(state, previous, unsent)
+        lines.append(unsent_line(unsent))
+        print("не отправлено: {}; повтор в следующем прогоне".format(", ".join(unsent)),
+              file=sys.stderr)
 
-    if not runlog_append([run_line(results)] + event_lines(events),
-                         path=args.runlog):
+    if not runlog_append(lines, path=args.runlog):
         print("журнал не записан", file=sys.stderr)
 
     saved = save_state(state, args.state)
-    print("Проверено {}, лежит {}, сообщений {}".format(
-        len(results), sum(1 for r in results if not r["ok"]), len(messages)))
-    if not saved or failed:
-        return 1
-    return 0
+    print("Проверено {}, лежит {}, сообщений {}, не отправлено {}".format(
+        len(results), sum(1 for r in results if not r["ok"]), len(batches), len(unsent)))
+    return 0 if saved else 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:

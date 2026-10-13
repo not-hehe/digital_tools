@@ -416,7 +416,8 @@ def test_alert_two_down_are_separate():
 
 def test_alert_three_down_grouped_in_input_order():
     events = [ev("down", "v1"), ev("down", "v3"), ev("down", "v7")]
-    assert alert.build_messages(events) == ["🔴 Обнаружено падение: v1, v3, v7"]
+    assert alert.build_messages(events) == [
+        "🔴 Обнаружено падение:\n- Коллектор v1\n- Коллектор v3\n- Коллектор v7"]
 
 
 def test_alert_still_down_is_silent():
@@ -437,16 +438,50 @@ def test_alert_up_message_after_downs():
                                             "🟢 Коллектор v2 снова работает"]
 
 
-def test_alert_ups_are_never_grouped():
-    events = [ev("up", "v1"), ev("up", "v2"), ev("up", "v3")]
+def test_alert_two_ups_are_separate():
+    events = [ev("up", "v1"), ev("up", "v2")]
     assert alert.build_messages(events) == ["🟢 Коллектор v1 снова работает",
-                                            "🟢 Коллектор v2 снова работает",
-                                            "🟢 Коллектор v3 снова работает"]
+                                            "🟢 Коллектор v2 снова работает"]
+
+
+def test_alert_three_ups_grouped_as_list():
+    # Формат Вани 2026-10-13: заголовок и по строке на коллектор.
+    events = [ev("up", "v5"), ev("up", "v8"), ev("up", "v10")]
+    assert alert.build_messages(events) == [
+        "🟢 Коллектор снова работает:\n- Коллектор v5\n- Коллектор v8\n- Коллектор v10"]
+
+
+def test_alert_batches_carry_names():
+    events = [ev("down", "v1"), ev("down", "v2"), ev("down", "v3"), ev("up", "v9")]
+    batches = alert.build_batches(events)
+    assert [b["names"] for b in batches] == [["v1", "v2", "v3"], ["v9"]], batches
+
+
+def test_alert_send_batches_returns_unsent_names():
+    batches = [{"text": "a", "names": ["v1", "v2"]}, {"text": "b", "names": ["v3"]},
+               {"text": "c", "names": ["v4"]}]
+    seen = []
+    def sender(text):
+        seen.append(text)
+        return text != "a" and text != "c"
+    assert alert.send_batches(batches, sender) == ["v1", "v2", "v4"]
+    assert seen == ["a", "b", "c"], "после неудачи отправка не останавливается"
+
+
+def test_state_keep_unreported_reverts_or_drops():
+    old = {"v1": {"status": "down", "since": T0}, "v2": {"status": "up", "since": T0}}
+    new = {"v1": {"status": "up", "since": T1}, "v2": {"status": "down", "since": T1},
+           "v3": {"status": "down", "since": T1}}
+    got = state.keep_unreported(new, old, ["v1", "v3"])
+    assert got["v1"] == old["v1"], "неотправленный подъём: статус остаётся down"
+    assert got["v2"] == new["v2"], "отправленное падение продвинуто"
+    assert "v3" not in got, "первый запуск без записи: коллектор выпадает, чтобы упасть снова"
 
 
 def test_alert_group_min_parameter():
     events = [ev("down", "v1"), ev("down", "v2")]
-    assert alert.build_messages(events, group_min=2) == ["🔴 Обнаружено падение: v1, v2"]
+    assert alert.build_messages(events, group_min=2) == [
+        "🔴 Обнаружено падение:\n- Коллектор v1\n- Коллектор v2"]
     assert len(alert.build_messages(events, group_min=GROUP_MIN_DOWN)) == 2
 
 
@@ -613,7 +648,7 @@ def run_main(argv, env=None, **patches):
 
 
 saved_main = {n: getattr(main_module, n)
-              for n in ("check_all", "load_collectors", "save_state", "send_all")}
+              for n in ("check_all", "load_collectors", "save_state", "send_batches")}
 
 
 def forbidden_check_all(collectors):
@@ -632,21 +667,26 @@ def test_run_without_secrets_does_not_probe():
     assert code == 1 and "TELEGRAM_BOT_TOKEN" in err, (code, err)
 
 
-def test_run_failed_send_returns_1_but_saves_state():
+def test_run_failed_send_keeps_state_for_retry_and_returns_0():
     saved = []
     down = {"name": "v7", "url": "u", "ok": False, "status_code": 503, "failure_kind": None,
             "error": None, "attempts": [{"status_code": 503, "failure_kind": None,
                                          "elapsed_ms": 1}], "checked_at": T0}
     with tempfile.TemporaryDirectory() as tmp:
-        code, _, _ = run_main(
-            ["--runlog", str(Path(tmp) / "runs.log"), "--state", str(Path(tmp) / "s.txt")],
+        log = Path(tmp) / "runs.log"
+        code, _, err = run_main(
+            ["--runlog", str(log), "--state", str(Path(tmp) / "s.txt")],
             env={"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"},
             load_collectors=lambda path: [{"name": "v7", "url": "u"}],
             check_all=lambda collectors: [down],
-            send_all=lambda messages, sender: 1,
+            send_batches=lambda batches, sender: ["v7"],
             save_state=lambda st, path: saved.append(st) or True)
-    assert code == 1, code
-    assert len(saved) == 1, "состояние должно сохраниться и при сбое отправки"
+        assert "unsent v7" in log.read_text(encoding="utf-8")
+    # Сбой канала - не сбой скрипта: код 0, а v7 выпадает из состояния,
+    # чтобы следующий прогон увидел падение заново и отправил сообщение.
+    assert code == 0, (code, err)
+    assert saved == [{}], saved
+    assert "не отправлено: v7" in err, err
 
 
 def test_run_runlog_flag_sets_path():

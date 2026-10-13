@@ -99,3 +99,17 @@ def apply_results(state: Dict[str, dict], results: List[dict],
                            "name": name, "since": since, "reason": reason_of(result)})
             new_state[name] = {"status": STATUS_DOWN, "since": since}
     return new_state, events
+
+
+def keep_unreported(new_state: Dict[str, dict], old_state: Dict[str, dict],
+                    names: List[str]) -> Dict[str, dict]:
+    """Откатывает коллекторы, о которых сообщение не ушло, к прошлому статусу:
+    следующий прогон увидит ту же смену и отправит его снова. Иначе сообщение
+    терялось бы навсегда, а состояние уже считало его сообщённым."""
+    result = dict(new_state)
+    for name in names:
+        if name in old_state:
+            result[name] = old_state[name]
+        else:
+            result.pop(name, None)
+    return result
