@@ -175,7 +175,8 @@ def timer_text(minutes_since_fall, minutes_since_sent):
 
 
 def an_hour_ago():
-    return (datetime.now() - timedelta(hours=1)).replace(microsecond=0)
+    # МСК, как в state.txt: локальное время ломало тесты на машине в другом поясе.
+    return (now_msk() - timedelta(hours=1)).replace(microsecond=0)
 
 
 # ---------------------------------------------------------------------------

@@ -17,8 +17,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Заглушка печатает метку, код возврата задаётся окружением.
-STUB = ("import os, sys\n"
+# Заглушка печатает метку; задержка и код возврата задаются окружением.
+STUB = ("import os, sys, time\n"
+        "time.sleep(float(os.environ.get('STUB_NOTIFY_SLEEP', '0')))\n"
         "print('STUB notify')\n"
         "sys.exit(int(os.environ.get('STUB_NOTIFY_EXIT', '0')))\n")
 
@@ -37,13 +38,26 @@ def make_copy(tmp: Path) -> Path:
     return app
 
 
-def run_sh(app: Path, *args, collectors="/nonexistent", notify_exit=0) -> int:
+def start_run_sh(app: Path, *args, collectors="/nonexistent", notify_exit=0,
+                 notify_sleep=0) -> subprocess.Popen:
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("TELEGRAM_", "CC_", "PYTHON"))}
-    env.update({"CC_COLLECTORS_FILE": collectors, "STUB_NOTIFY_EXIT": str(notify_exit)})
+    env.update({"CC_COLLECTORS_FILE": collectors, "STUB_NOTIFY_EXIT": str(notify_exit),
+                "STUB_NOTIFY_SLEEP": str(notify_sleep)})
     # Как cron: через /bin/sh -c, чтобы строка #! действительно решала, кто исполняет файл.
-    return subprocess.run(["/bin/sh", "-c", "./run.sh " + " ".join(args)], cwd=str(app),
-                          env=env, capture_output=True, text=True, timeout=60).returncode
+    return subprocess.Popen(["/bin/sh", "-c", "./run.sh " + " ".join(args)], cwd=str(app),
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run_sh(app: Path, *args, **kwargs) -> int:
+    return start_run_sh(app, *args, **kwargs).wait(timeout=60)
+
+
+def away_from_minute_edge():
+    # run.sh считает целые минуты по своим часам; отметка, поставленная тестом за секунду
+    # до смены минуты, превратила бы 4 минуты в 5.
+    if time.time() % 60 > 55:
+        time.sleep(61 - time.time() % 60)
 
 
 def log_text(app: Path) -> str:
@@ -90,6 +104,7 @@ def test_ac22_stamp_five_minutes_old_sends_four_minutes_old_waits():
     with tempfile.TemporaryDirectory() as tmp:
         app = make_copy(Path(tmp))
         (app / "data").mkdir()
+        away_from_minute_edge()
         stamp(app).write_text(str(int(time.time()) - 240))
         run_sh(app)
         assert log_text(app).count("STUB notify") == 0, log_text(app)
@@ -117,6 +132,42 @@ def test_ac22_successful_run_clears_stamp():
         assert not stamp(app).exists()
         run_sh(app)
         assert log_text(app).count("STUB notify") == 2, "сбой после починки - сразу"
+
+
+def wait_for(predicate, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline, "не дождались"
+        time.sleep(0.05)
+
+
+def test_lock_held_while_failure_alert_is_sent():
+    # Аудит 2026-10-14: лок с pid подоболочки протухал, пока уходило сообщение о сбое,
+    # и следующий запуск шёл параллельно.
+    with tempfile.TemporaryDirectory() as tmp:
+        app = make_copy(Path(tmp))
+        first = start_run_sh(app, notify_sleep=3)
+        wait_for(lambda: "сообщение о сбое" in log_text(app)
+                 or (app / "data" / ".run.lock" / "pid").exists())
+        time.sleep(1.0)
+        assert first.poll() is None, "первый прогон ещё должен отправлять сообщение"
+        assert run_sh(app) == 0
+        assert "прогон уже идёт" in log_text(app), log_text(app)
+        assert first.wait(timeout=30) == 1
+        assert not (app / "data" / ".run.lock").exists(), "свой лок снимается на выходе"
+        assert log_text(app).count("STUB notify") == 1, log_text(app)
+
+
+def test_exit_keeps_foreign_lock():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = make_copy(Path(tmp))
+        first = start_run_sh(app, notify_sleep=2)
+        pid_file = app / "data" / ".run.lock" / "pid"
+        wait_for(pid_file.exists)
+        time.sleep(0.5)
+        pid_file.write_text(str(os.getpid()))
+        first.wait(timeout=30)
+        assert pid_file.read_text() == str(os.getpid()), "чужой лок снят на выходе"
 
 
 def run_all() -> int:

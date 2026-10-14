@@ -100,6 +100,11 @@ def plan_batches(state: Dict[str, dict], events: List[dict], timer: Optional[dic
             batches += (fall_batches if fresh else remind_batches)(names, group_min)
         elif is_due(timer, now):
             batches += remind_batches(names, group_min)
+        else:
+            # Упали вместе с первым, но сообщение о них не ушло: повтор сразу, а не на
+            # отметке, иначе «Обнаружено падение» о них не придёт никогда (аудит 2026-10-14).
+            batches += fall_batches([n for n in names if state[n]["status"] == STATUS_PENDING
+                                     and state[n]["since"] <= timer["last_change"]], group_min)
     batches += up_batches([e["name"] for e in events if e["event"] == EVENT_UP], group_min)
     return batches
 

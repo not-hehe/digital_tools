@@ -290,6 +290,22 @@ def test_probe_check_all_keeps_input_order():
     assert [r["name"] for r in got] == ["a", "b", "c"], got
 
 
+def test_probe_check_all_one_thread_per_target():
+    # Аудит 2026-10-14: 16 целей на 15 потоках - при глухих целях прогон вдвое дольше.
+    seen = []
+    real_pool = probe.concurrent.futures.ThreadPoolExecutor
+
+    def spy_pool(max_workers=None, **kwargs):
+        seen.append(max_workers)
+        return real_pool(max_workers=max_workers, **kwargs)
+
+    collectors = [{"name": "v{}".format(i), "url": "https://h/v{}".format(i)} for i in range(16)]
+    with mock.patch.object(probe, "check_collector", lambda c, **kw: {"name": c["name"]}), \
+            mock.patch.object(probe.concurrent.futures, "ThreadPoolExecutor", spy_pool):
+        probe.check_all(collectors)
+    assert seen == [16], seen
+
+
 def test_probe_check_all_empty():
     assert probe.check_all([]) == []
 
@@ -614,6 +630,19 @@ def test_reminder_ac16_partial_remind_failure_keeps_mark():
     assert len(r.run(at(10, 6), down={"v1", "v7"})) == 2
 
 
+def test_reminder_partial_first_fall_repeats_before_mark():
+    # Аудит 2026-10-14: v7 ушло, v8 нет - таймер открылся, но v8 не ждёт отметки.
+    r = Runs(["v1", "v7", "v8", "v9"])
+    assert r.run(at(10, 0), down={"v7", "v8"}, fail={"v8"}) == [
+        "🔴 Обнаружено падение, v7", "🔴 Обнаружено падение, v8"]
+    assert r.state["v8"]["status"] == "pending" and r.timer["last_change"] == at(10, 0)
+    assert r.run(at(10, 1), down={"v7", "v8"}) == ["🔴 Обнаружено падение, v8"]
+    assert r.state["v8"]["status"] == "down"
+    assert r.run(at(10, 2), down={"v7", "v8"}) == []
+    assert r.run(at(10, 3), down={"v7", "v8", "v9"}) == [], "упавший позже ждёт отметки"
+    assert len(r.run(at(10, 5), down={"v7", "v8", "v9"})) == 1, "три лежащих - одним списком"
+
+
 def test_reminder_ac16_unsent_fall_stays_pending_and_repeats():
     r = Runs(["v1", "v7"])
     assert r.run(at(10, 0), down={"v7"}, fail={"*"}) == ["🔴 Обнаружено падение, v7"]
@@ -803,6 +832,24 @@ def test_runlog_trims_lines_older_than_week():
         assert read_lines(path) == ["2026-10-08 00:00:00 run keep1",
                                     "2026-10-13 12:00:00 run keep2",
                                     "2026-10-14 10:00:00 run new"]
+
+
+def test_runlog_trim_goes_through_tmp_and_replace():
+    calls = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "runs.log"
+        path.write_text("2026-10-01 09:00:00 run old\n", encoding="utf-8")
+        with mock.patch.object(runlog.os, "replace", spy):
+            runlog.append(["2026-10-14 10:00:00 run new"], path, now=NOW14)
+        assert calls == [(str(path) + ".tmp", str(path))], calls
+        assert read_lines(path) == ["2026-10-14 10:00:00 run new"]
+        assert not Path(str(path) + ".tmp").exists()
 
 
 def test_runlog_keeps_boundary_line_and_respects_keep_days():

@@ -110,6 +110,9 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     rm -rf "$LOCK_DIR"
     mkdir "$LOCK_DIR" || fail_start "не удалось создать лок $LOCK_DIR"
 fi
+# Pid самой обёртки, а не подоболочки: лок должен жить и пока уходит сообщение о сбое,
+# иначе следующий запуск снимет его как протухший и прогоны пойдут вдвоём (аудит 2026-10-14).
+echo "$$" > "$LOCK_DIR/pid"
 
 # Вывод текущего прогона хранится отдельно: в сообщение о сбое попадает его хвост.
 # Аргументы mktemp различаются на macOS и Linux.
@@ -125,7 +128,8 @@ if [ -z "$RUN_OUT" ]; then
     log "не удалось создать временный файл, хвост лога в сообщение о сбое не попадёт"
     RUN_OUT="/dev/null"
 fi
-trap 'rm -rf "$LOCK_DIR"; [ "$RUN_OUT" != "/dev/null" ] && rm -f "$RUN_OUT"' EXIT
+# Чужой лок не снимаем: его мог забрать следующий запуск.
+trap '[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK_DIR"; [ "$RUN_OUT" != "/dev/null" ] && rm -f "$RUN_OUT"' EXIT
 
 # Прогон в фоновой подоболочке: сигнал обёртке останавливает и python.
 # -u: вывод без буферизации, метки времени соответствуют событиям.
@@ -137,7 +141,6 @@ trap 'rm -rf "$LOCK_DIR"; [ "$RUN_OUT" != "/dev/null" ] && rm -f "$RUN_OUT"' EXI
     exit "${PIPESTATUS[0]}"
 ) &
 SUB=$!
-echo "$SUB" > "$LOCK_DIR/pid"
 trap 'log "получен сигнал, останавливаю прогон"; pkill -TERM -P "$SUB" 2>/dev/null; kill -TERM "$SUB" 2>/dev/null; exit 143' TERM INT
 wait "$SUB"
 CODE=$?
