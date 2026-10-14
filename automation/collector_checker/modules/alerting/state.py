@@ -1,5 +1,6 @@
 """Состояние между прогонами: строка на коллектор, `v7 down 2026-10-12T15:00:03`.
 Отсутствующий файл считается первым запуском; ошибка записи завершает прогон кодом 1.
+pending - лежит, но в чат ещё не сообщено: ждёт отметки таймера или повтора отправки.
 """
 
 import os
@@ -13,12 +14,15 @@ from ..probe import reason_of
 
 STATUS_UP = "up"
 STATUS_DOWN = "down"
+STATUS_PENDING = "pending"
+_LYING = (STATUS_DOWN, STATUS_PENDING)
 
 EVENT_DOWN = "down"
 EVENT_STILL_DOWN = "still_down"
 EVENT_UP = "up"
+EVENT_QUIET_UP = "quiet_up"
 
-_HEADER = "# collector status since(MSK)"
+_HEADER = "# collector status since(MSK); pending - лежит, в чат ещё не сообщено"
 
 
 def parse_state(text: str) -> Dict[str, dict]:
@@ -30,8 +34,8 @@ def parse_state(text: str) -> Dict[str, dict]:
             continue
         parts = line.split()
         try:
-            if len(parts) != 3 or parts[1] not in (STATUS_UP, STATUS_DOWN):
-                raise ValueError("ожидается '<имя> up|down <время>'")
+            if len(parts) != 3 or parts[1] not in (STATUS_UP,) + _LYING:
+                raise ValueError("ожидается '<имя> up|down|pending <время>'")
             state[parts[0]] = {"status": parts[1], "since": datetime.fromisoformat(parts[2])}
         except ValueError as e:
             print("состояние: строка {} пропущена ({}): {!r}".format(number, e, raw),
@@ -77,27 +81,36 @@ def save_state(state: Dict[str, dict], path: Optional[Path] = None) -> bool:
 
 def apply_results(state: Dict[str, dict], results: List[dict],
                   now: Optional[datetime] = None) -> Tuple[Dict[str, dict], List[dict]]:
-    """Новое состояние по проверенным коллекторам и события."""
+    """Новое состояние по проверенным коллекторам и события. Новое падение - pending:
+    сообщено ли о нём, решает reminder.settle после отправки."""
     now = now_msk() if now is None else now
     new_state = {}
     events = []
     for result in results:
         name = result["name"]
         previous = state.get(name)
-        was_down = previous is not None and previous["status"] == STATUS_DOWN
+        was = previous["status"] if previous is not None else STATUS_UP
         if result["ok"]:
-            if was_down:
-                events.append({"event": EVENT_UP, "name": name, "since": now,
+            if was in _LYING:
+                event = EVENT_UP if was == STATUS_DOWN else EVENT_QUIET_UP
+                events.append({"event": event, "name": name, "since": now,
                                "reason": reason_of(result)})
                 new_state[name] = {"status": STATUS_UP, "since": now}
             else:
                 new_state[name] = previous or {"status": STATUS_UP, "since": now}
+        elif was in _LYING:
+            events.append({"event": EVENT_STILL_DOWN, "name": name,
+                           "since": previous["since"], "reason": reason_of(result)})
+            new_state[name] = dict(previous)
         else:
-            since = previous["since"] if was_down else now
-            events.append({"event": EVENT_STILL_DOWN if was_down else EVENT_DOWN,
-                           "name": name, "since": since, "reason": reason_of(result)})
-            new_state[name] = {"status": STATUS_DOWN, "since": since}
+            events.append({"event": EVENT_DOWN, "name": name, "since": now,
+                           "reason": reason_of(result)})
+            new_state[name] = {"status": STATUS_PENDING, "since": now}
     return new_state, events
+
+
+def lying(state: Dict[str, dict]) -> List[str]:
+    return [name for name, entry in state.items() if entry["status"] in _LYING]
 
 
 def keep_unreported(new_state: Dict[str, dict], old_state: Dict[str, dict],

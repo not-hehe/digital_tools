@@ -1,8 +1,9 @@
- #!/bin/bash
-# Запуск одного прогона из cron:  0 * * * * /path/to/collector_checker/run.sh > /dev/null 2>&1
+#!/bin/bash
+# Запуск одного прогона из cron:  * * * * * /path/to/collector_checker/run.sh > /dev/null 2>&1
 # Вывод пишется в logs/; перенаправление отключает почту cron.
 # Аргументы передаются в main.py: ./run.sh --no-notify
-# При ошибке прогона или невозможности запуска отправляет сообщение в Telegram.
+# При ошибке прогона или невозможности запуска отправляет сообщение в Telegram,
+# не чаще раза в FAIL_EVERY_MIN минут.
 # Пропущенный cron-ом запуск не отслеживается; его видно по пропуску в data/runs.log.
 set -uo pipefail
 
@@ -32,7 +33,7 @@ log() {
 }
 
 # Отправка сообщения о сбое: notify.py, при недоступном python curl.
-alert() {
+send_alert() {
     local text="$1"
     if [ -n "$PYTHON" ] && "$PYTHON" tools/notify.py "$text" 2>&1 | while IFS= read -r l; do log "$l"; done; then
         return 0
@@ -50,6 +51,28 @@ alert() {
     fi
     log "сообщение о сбое не доставлено: notify.py и curl не справились (нет python или curl, не заданы TELEGRAM_* или Telegram отказал)"
     return 1
+}
+
+# Прогон идёт каждую минуту, сломанный скрипт слал бы 60 сообщений в час (Ваня, 2026-10-14).
+# Минуты считаются целыми, как у напоминаний о коллекторах. Неотправленное отметку
+# не ставит: следующий запуск попробует снова.
+FAIL_STAMP="data/.fail_alert"
+FAIL_EVERY_MIN=5
+
+alert() {
+    local now last passed
+    now="$(date +%s)"
+    last="$(cat "$FAIL_STAMP" 2>/dev/null || true)"
+    if [[ "$last" =~ ^[0-9]+$ ]]; then
+        passed=$(( now / 60 - last / 60 ))
+        if [ "$passed" -ge 0 ] && [ "$passed" -lt "$FAIL_EVERY_MIN" ]; then
+            log "сообщение о сбое отложено, ещё $(( FAIL_EVERY_MIN - passed )) мин"
+            return 0
+        fi
+    fi
+    send_alert "$1" || return 1
+    echo "$now" 2>/dev/null > "$FAIL_STAMP" \
+        || log "отметка $FAIL_STAMP не записана: сообщения о сбое пойдут каждую минуту"
 }
 
 fail_start() {
@@ -121,7 +144,10 @@ CODE=$?
 trap - TERM INT
 
 # Код 2 (ошибка аргументов) не оповещается. Недоставка в Telegram кода 1 не даёт.
-if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
+# Удачный прогон снимает отметку: новый сбой после починки сообщается сразу.
+if [ "$CODE" -eq 0 ]; then
+    rm -f "$FAIL_STAMP"
+elif [ "$CODE" -ne 2 ]; then
     alert "$(printf 'Прогон collector_checker завершился ошибкой (код %s): список не загружен, состояние не сохранено или python упал\nВремя: %s\n\nПоследние строки лога:\n%s' \
         "$CODE" "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
         "$(tail -n 10 "$RUN_OUT")")"

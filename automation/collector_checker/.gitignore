@@ -5,6 +5,9 @@
 data/collectors.txt
 data/state.txt
 data/state.txt.tmp
+data/state_down.txt
+data/state_down.txt.tmp
+data/.fail_alert
 data/runs.log
 data/.run.lock/
 logs/

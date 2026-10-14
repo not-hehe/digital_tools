@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -24,7 +24,7 @@ import requests
 
 import main as main_module
 from modules import sources
-from modules.alerting import alert, notifier, runlog, state
+from modules.alerting import alert, notifier, reminder, runlog, state
 from modules.probe import checker as probe
 from modules.probe import failures
 from modules.config import (ATTEMPTS, GROUP_MIN_DOWN, RETRY_PAUSE, TELEGRAM_ENDPOINT_PAUSE,
@@ -168,14 +168,23 @@ def test_probe_target_specific_codes():
     result = probe.check_collector(pixel, session=session, sleep=lambda s: None)
     assert result["ok"] is True and len(session.calls) == 1, result
     session = ProbeSession([500, 500, 500])
-    result = probe.check_collector(pixel, session=session, sleep=lambda s: None)
+    result = probe.check_collector(pixel, session=session, sleep=lambda s: None, attempts=3)
     assert result["ok"] is False and len(session.calls) == 3, result
     result, _, _ = check([404, 404, 404])
     assert result["ok"] is False, "без колонки 404 это падение"
 
 
-def test_probe_503_then_200():
+def test_probe_single_attempt_by_default():
+    # AC-13: моргание не гасится повтором, следующий прогон через минуту.
     result, session, sleeps = check([503, 200])
+    assert ATTEMPTS == 1
+    assert result["ok"] is False and result["status_code"] == 503, result
+    assert len(session.calls) == 1 and len(result["attempts"]) == 1, result
+    assert sleeps == [], sleeps
+
+
+def test_probe_503_then_200():
+    result, session, sleeps = check([503, 200], attempts=3)
     assert result["ok"] is True
     assert len(result["attempts"]) == 2
     assert sleeps == [RETRY_PAUSE], sleeps
@@ -183,16 +192,16 @@ def test_probe_503_then_200():
 
 
 def test_probe_503_three_times():
-    result, _, sleeps = check([503, 503, 503])
+    result, _, sleeps = check([503, 503, 503], attempts=3)
     assert result["ok"] is False
-    assert len(result["attempts"]) == ATTEMPTS == 3
+    assert len(result["attempts"]) == 3
     assert len(sleeps) == 2, "пауза после последней попытки не нужна: {}".format(sleeps)
     assert result["status_code"] == 503
 
 
 def test_probe_timeout_three_times():
     exc = requests.exceptions.ConnectTimeout("connect timed out")
-    result, _, _ = check([exc, exc, exc])
+    result, _, _ = check([exc, exc, exc], attempts=3)
     assert result["ok"] is False
     assert result["failure_kind"] == "timeout"
     assert result["status_code"] is None
@@ -206,7 +215,7 @@ def test_probe_redirect_is_down():
 
 
 def test_probe_attempt_fields():
-    result, _, _ = check([503, requests.exceptions.SSLError("x"), 200])
+    result, _, _ = check([503, requests.exceptions.SSLError("x"), 200], attempts=3)
     attempts = result["attempts"]
     assert [a["status_code"] for a in attempts] == [503, None, 200], attempts
     assert [a["failure_kind"] for a in attempts] == [None, "tls", None], attempts
@@ -232,11 +241,11 @@ class SleepingSession(ProbeSession):
         return super().get(url, **kwargs)
 
 
-def check_slow(script, seconds, deadline):
+def check_slow(script, seconds, deadline, **kwargs):
     session = SleepingSession(script, seconds)
     sleeps = []
     result = probe.check_collector(COLLECTOR, session=session, sleep=sleeps.append,
-                                   deadline=deadline)
+                                   deadline=deadline, **kwargs)
     return result, session, sleeps
 
 
@@ -265,7 +274,7 @@ def test_probe_capped_attempt_returns_by_deadline():
 
 
 def test_probe_attempt_within_deadline_is_normal():
-    result, session, _ = check_slow([503, 200], 0.05, 1.0)
+    result, session, _ = check_slow([503, 200], 0.05, 1.0, attempts=3)
     assert result["ok"] is True and len(session.calls) == 2, result
 
 
@@ -306,7 +315,7 @@ def test_state_new_ok():
 
 def test_state_new_not_ok():
     new, events = state.apply_results({}, [res("v1", False)], now=T1)
-    assert new == {"v1": {"status": "down", "since": T1}}
+    assert new == {"v1": {"status": "pending", "since": T1}}
     assert [(e["event"], e["name"], e["since"]) for e in events] == [("down", "v1", T1)]
     assert events[0]["reason"] == "HTTP 503"
 
@@ -314,8 +323,34 @@ def test_state_new_not_ok():
 def test_state_up_not_ok():
     new, events = state.apply_results({"v1": {"status": "up", "since": T0}},
                                       [res("v1", False)], now=T1)
-    assert new["v1"] == {"status": "down", "since": T1}
+    assert new["v1"] == {"status": "pending", "since": T1}
     assert [e["event"] for e in events] == ["down"] and events[0]["since"] == T1
+
+
+def test_state_pending_not_ok_stays_pending():
+    new, events = state.apply_results({"v1": {"status": "pending", "since": T0}},
+                                      [res("v1", False)], now=T1)
+    assert new["v1"] == {"status": "pending", "since": T0}
+    assert [e["event"] for e in events] == ["still_down"] and events[0]["since"] == T0
+
+
+def test_state_pending_ok_is_quiet_up():
+    new, events = state.apply_results({"v1": {"status": "pending", "since": T0}},
+                                      [res("v1", True)], now=T1)
+    assert new["v1"] == {"status": "up", "since": T1}
+    assert [e["event"] for e in events] == ["quiet_up"], events
+
+
+def test_state_lying_keeps_order():
+    st = {"v1": {"status": "up", "since": T0}, "v3": {"status": "pending", "since": T0},
+          "v7": {"status": "down", "since": T0}}
+    assert state.lying(st) == ["v3", "v7"]
+    assert state.lying({}) == []
+
+
+def test_state_roundtrip_pending():
+    original = {"v7": {"status": "down", "since": T0}, "v8": {"status": "pending", "since": T1}}
+    assert state.parse_state(state.render_state(original)) == original
 
 
 def test_state_down_not_ok_keeps_since():
@@ -429,64 +464,254 @@ def test_state_save_unwritable_returns_false():
 # alert
 # ---------------------------------------------------------------------------
 
-def ev(kind, name):
-    return {"event": kind, "name": name, "since": T1, "reason": "HTTP 503"}
+def texts(batches):
+    return [b["text"] for b in batches]
 
 
-def test_alert_no_events():
-    assert alert.build_messages([]) == []
+def test_alert_empty_names_give_nothing():
+    assert alert.fall_batches([]) == [] and alert.remind_batches([]) == []
+    assert alert.up_batches([]) == []
 
 
-def test_alert_one_down():
-    assert alert.build_messages([ev("down", "v7")]) == ["🔴 Обнаружено падение, v7"]
+def test_alert_fall_single_and_list():
+    assert texts(alert.fall_batches(["v1", "v7"])) == [
+        "🔴 Обнаружено падение, v1", "🔴 Обнаружено падение, v7"]
+    assert texts(alert.fall_batches(["v1", "v3", "v7"])) == [
+        "🔴 Обнаружено падение коллекторов:\n- Коллектор v1\n- Коллектор v3\n- Коллектор v7"]
 
 
-def test_alert_two_down_are_separate():
-    got = alert.build_messages([ev("down", "v1"), ev("down", "v7")])
-    assert got == ["🔴 Обнаружено падение, v1", "🔴 Обнаружено падение, v7"], got
+def test_alert_remind_single_and_list():
+    assert texts(alert.remind_batches(["v7", "v8"])) == [
+        "🔴 Коллектор v7 всё ещё не работает", "🔴 Коллектор v8 всё ещё не работает"]
+    assert texts(alert.remind_batches(["v1", "v7", "v8"])) == [
+        "🔴 Коллекторы всё ещё не работают:\n- Коллектор v1\n- Коллектор v7\n- Коллектор v8"]
 
 
-def test_alert_three_down_grouped_in_input_order():
-    events = [ev("down", "v1"), ev("down", "v3"), ev("down", "v7")]
-    assert alert.build_messages(events) == [
-        "🔴 Обнаружено падение:\n- Коллектор v1\n- Коллектор v3\n- Коллектор v7"]
-
-
-def test_alert_still_down_is_silent():
-    # Правило Вани 2026-10-13: про лежащий коллектор сообщаем один раз, не каждый час.
-    events = [ev("still_down", "v1"), ev("still_down", "v2"), ev("still_down", "v3")]
-    assert alert.build_messages(events) == []
-    assert alert.build_messages([ev("still_down", "v3"), ev("down", "v7")]) == ["🔴 Обнаружено падение, v7"]
-
-
-def test_alert_marks_in_texts():
-    assert alert.build_messages([ev("down", "v7")])[0].startswith(alert.DOWN_MARK + " ")
-    assert alert.build_messages([ev("up", "v7")])[0].startswith(alert.UP_MARK + " ")
-
-
-def test_alert_up_message_after_downs():
-    events = [ev("up", "v2"), ev("down", "v7")]
-    assert alert.build_messages(events) == ["🔴 Обнаружено падение, v7",
-                                            "🟢 Коллектор v2 снова работает"]
-
-
-def test_alert_two_ups_are_separate():
-    events = [ev("up", "v1"), ev("up", "v2")]
-    assert alert.build_messages(events) == ["🟢 Коллектор v1 снова работает",
-                                            "🟢 Коллектор v2 снова работает"]
-
-
-def test_alert_three_ups_grouped_as_list():
+def test_alert_up_single_and_list():
     # Формат Вани 2026-10-13: заголовок и по строке на коллектор.
-    events = [ev("up", "v5"), ev("up", "v8"), ev("up", "v10")]
-    assert alert.build_messages(events) == [
+    assert texts(alert.up_batches(["v1", "v2"])) == [
+        "🟢 Коллектор v1 снова работает", "🟢 Коллектор v2 снова работает"]
+    assert texts(alert.up_batches(["v5", "v8", "v10"])) == [
         "🟢 Коллектор снова работает:\n- Коллектор v5\n- Коллектор v8\n- Коллектор v10"]
 
 
-def test_alert_batches_carry_names():
-    events = [ev("down", "v1"), ev("down", "v2"), ev("down", "v3"), ev("up", "v9")]
-    batches = alert.build_batches(events)
-    assert [b["names"] for b in batches] == [["v1", "v2", "v3"], ["v9"]], batches
+def test_alert_marks_kinds_and_names():
+    fall, remind, up = (alert.fall_batches(["v7"])[0], alert.remind_batches(["v7"])[0],
+                        alert.up_batches(["v7"])[0])
+    assert fall["text"].startswith(alert.DOWN_MARK + " ") and fall["kind"] == "fall"
+    assert remind["text"].startswith(alert.DOWN_MARK + " ") and remind["kind"] == "remind"
+    assert up["text"].startswith(alert.UP_MARK + " ") and up["kind"] == "up"
+    group = alert.remind_batches(["v1", "v2", "v3"])
+    assert [b["names"] for b in group] == [["v1", "v2", "v3"]], group
+
+
+# ---------------------------------------------------------------------------
+# reminder: таймер и выбор сообщений по минутам (AC-14..AC-18)
+# ---------------------------------------------------------------------------
+
+def at(h, m, s=0):
+    return datetime(2026, 10, 14, h, m, s)
+
+
+class Runs:
+    """Прогоны подряд в том же порядке, что main.run, без сети и файлов."""
+
+    def __init__(self, names, start=None):
+        self.names = names
+        self.state, self.timer, self.events = {}, None, []
+        self.run(start or at(9, 0))
+
+    def run(self, now, down=(), fail=()):
+        """down - кто не ответил; fail - чьи сообщения не уходят ("*" - все)."""
+        previous = self.state
+        timer = reminder.drop_stale(self.timer, previous)
+        new, self.events = state.apply_results(
+            previous, [res(n, n not in down) for n in self.names], now=now)
+        batches = reminder.plan_batches(new, self.events, timer, now)
+        unsent = [n for b in batches for n in b["names"] if "*" in fail or n in fail]
+        self.state, self.timer = reminder.settle(new, previous, timer, batches, unsent, now)
+        return texts(batches)
+
+
+def test_reminder_ac14_one_collector_every_five_minutes():
+    r = Runs(["v1", "v7"])
+    assert r.run(at(10, 0, 40), down={"v7"}) == ["🔴 Обнаружено падение, v7"]
+    assert r.timer == {"last_change": at(10, 0, 40), "alert_last_sent": at(10, 0, 40)}
+    assert r.run(at(10, 1, 30), down={"v7"}) == []
+    assert r.run(at(10, 4, 59), down={"v7"}) == []
+    # По минуте запуска: 10:05:20 после 10:00:40 - это уже отметка 10:05.
+    assert r.run(at(10, 5, 20), down={"v7"}) == ["🔴 Коллектор v7 всё ещё не работает"]
+    assert r.run(at(10, 6, 30), down={"v7"}) == []
+    assert r.run(at(10, 9, 59), down={"v7"}) == []
+    assert r.run(at(10, 10, 10), down={"v7"}) == ["🔴 Коллектор v7 всё ещё не работает"]
+    assert r.state["v7"] == {"status": "down", "since": at(10, 0, 40)}
+    assert [e["event"] for e in r.events] == ["still_down"]
+
+
+def test_reminder_ac15_new_fall_waits_for_mark():
+    # Пример Вани: 20:00 упал один - алерт и таймер; 20:03 упал второй - ждёт 20:05.
+    r = Runs(["v1", "v7", "v8", "v9", "v10"])
+    assert r.run(at(20, 0), down={"v7"}) == ["🔴 Обнаружено падение, v7"]
+    for minute in (1, 2):
+        assert r.run(at(20, minute), down={"v7"}) == []
+    for minute in (3, 4):
+        assert r.run(at(20, minute), down={"v7", "v8"}) == [], minute
+    assert r.state["v8"]["status"] == "pending"
+    assert r.run(at(20, 5), down={"v7", "v8"}) == [
+        "🔴 Коллектор v7 всё ещё не работает", "🔴 Коллектор v8 всё ещё не работает"]
+    assert r.state["v8"] == {"status": "down", "since": at(20, 3)}
+    for minute in (6, 7, 8, 9):
+        assert r.run(at(20, minute), down={"v7", "v8"}) == []
+    assert len(r.run(at(20, 10), down={"v7", "v8"})) == 2
+    assert r.timer["last_change"] == at(20, 0), "новое падение шаг не сдвигает"
+
+
+def test_reminder_ac15_three_and_more_go_as_one_list_in_config_order():
+    r = Runs(["v1", "v7", "v8", "v9", "v10"])
+    r.run(at(20, 0), down={"v7"})
+    assert r.run(at(20, 3), down={"v10", "v8", "v9", "v7"}) == []
+    assert r.run(at(20, 5), down={"v10", "v8", "v9", "v7"}) == [
+        "🔴 Коллекторы всё ещё не работают:\n- Коллектор v7\n- Коллектор v8"
+        "\n- Коллектор v9\n- Коллектор v10"]
+
+
+def test_reminder_ac15_fell_and_rose_between_marks_is_silent():
+    r = Runs(["v1", "v7", "v8"])
+    r.run(at(20, 0), down={"v7"})
+    assert r.run(at(20, 3), down={"v7", "v8"}) == []
+    assert r.run(at(20, 4), down={"v7"}) == []
+    assert [(e["event"], e["name"]) for e in r.events] == [("still_down", "v7"), ("quiet_up", "v8")]
+    assert r.run(at(20, 5), down={"v7"}) == ["🔴 Коллектор v7 всё ещё не работает"]
+
+
+def test_reminder_ac15_reported_rises_mark_stays():
+    r = Runs(["v1", "v7", "v8"])
+    r.run(at(20, 0), down={"v7"})
+    r.run(at(20, 3), down={"v7", "v8"})
+    r.run(at(20, 5), down={"v7", "v8"})
+    assert r.run(at(20, 7), down={"v8"}) == ["🟢 Коллектор v7 снова работает"]
+    assert r.timer["last_change"] == at(20, 0)
+    assert r.run(at(20, 10), down={"v8"}) == ["🔴 Коллектор v8 всё ещё не работает"]
+
+
+def test_reminder_ac16_unsent_remind_repeats_next_run_mark_unchanged():
+    r = Runs(["v1", "v7"])
+    r.run(at(10, 0), down={"v7"})
+    assert r.run(at(10, 5), down={"v7"}, fail={"*"}) == ["🔴 Коллектор v7 всё ещё не работает"]
+    assert r.timer["alert_last_sent"] == at(10, 0)
+    assert r.run(at(10, 6), down={"v7"}) == ["🔴 Коллектор v7 всё ещё не работает"]
+    for minute in (7, 8, 9):
+        assert r.run(at(10, minute), down={"v7"}) == []
+    assert r.run(at(10, 10), down={"v7"}) == ["🔴 Коллектор v7 всё ещё не работает"]
+
+
+def test_reminder_ac16_partial_remind_failure_keeps_mark():
+    r = Runs(["v1", "v7"])
+    r.run(at(10, 0), down={"v1", "v7"})
+    assert r.run(at(10, 5), down={"v1", "v7"}, fail={"v7"}) == [
+        "🔴 Коллектор v1 всё ещё не работает", "🔴 Коллектор v7 всё ещё не работает"]
+    assert r.timer["alert_last_sent"] == at(10, 0), "не ушло хоть одно - отметка прежняя"
+    assert len(r.run(at(10, 6), down={"v1", "v7"})) == 2
+
+
+def test_reminder_ac16_unsent_fall_stays_pending_and_repeats():
+    r = Runs(["v1", "v7"])
+    assert r.run(at(10, 0), down={"v7"}, fail={"*"}) == ["🔴 Обнаружено падение, v7"]
+    assert r.state["v7"]["status"] == "pending" and r.timer is None
+    assert r.run(at(10, 1), down={"v7"}) == ["🔴 Обнаружено падение, v7"]
+    assert r.state["v7"]["status"] == "down" and r.timer["last_change"] == at(10, 1)
+
+
+def test_reminder_ac17_all_up_resets_timer():
+    r = Runs(["v1", "v7"])
+    r.run(at(10, 0), down={"v7"})
+    assert r.run(at(10, 7)) == ["🟢 Коллектор v7 снова работает"]
+    assert r.timer is None
+    assert r.run(at(10, 9), down={"v7"}) == ["🔴 Обнаружено падение, v7"]
+    assert r.run(at(10, 10), down={"v7"}) == []
+    assert r.run(at(10, 13), down={"v7"}) == []
+    assert r.run(at(10, 14), down={"v7"}) == ["🔴 Коллектор v7 всё ещё не работает"]
+
+
+def test_reminder_ac17_unsent_up_keeps_timer():
+    r = Runs(["v1", "v7"])
+    r.run(at(10, 0), down={"v7"})
+    assert r.run(at(10, 2), fail={"*"}) == ["🟢 Коллектор v7 снова работает"]
+    assert r.state["v7"]["status"] == "down" and r.timer is not None
+    assert r.run(at(10, 3)) == ["🟢 Коллектор v7 снова работает"]
+    assert r.timer is None
+
+
+def test_reminder_ac17_lost_timer_reminds_now():
+    previous = {"v7": {"status": "down", "since": at(9, 0)}}
+    new, events = state.apply_results(previous, [res("v7", False)], now=at(10, 2))
+    batches = reminder.plan_batches(new, events, None, at(10, 2))
+    assert texts(batches) == ["🔴 Коллектор v7 всё ещё не работает"]
+    _, timer = reminder.settle(new, previous, None, batches, [], at(10, 2))
+    assert timer == {"last_change": at(10, 2), "alert_last_sent": at(10, 2)}
+
+
+def test_reminder_drop_stale_timer_without_lying():
+    timer = {"last_change": at(9, 0), "alert_last_sent": at(9, 0)}
+    assert reminder.drop_stale(timer, {"v7": {"status": "up", "since": at(9, 0)}}) is None
+    assert reminder.drop_stale(timer, {"v7": {"status": "pending", "since": at(9, 0)}}) == timer
+    assert reminder.drop_stale(None, {"v7": {"status": "down", "since": at(9, 0)}}) is None
+
+
+def test_reminder_ac18_three_fall_together_and_remind_before_up():
+    r = Runs(["v1", "v2", "v3", "v7"])
+    assert r.run(at(10, 0), down={"v1", "v3", "v7"}) == [
+        "🔴 Обнаружено падение коллекторов:\n- Коллектор v1\n- Коллектор v3\n- Коллектор v7"]
+    assert r.run(at(10, 5), down={"v1", "v3"}) == [
+        "🔴 Коллектор v1 всё ещё не работает", "🔴 Коллектор v3 всё ещё не работает",
+        "🟢 Коллектор v7 снова работает"]
+
+
+def test_reminder_is_due_respects_every_min():
+    timer = {"last_change": at(10, 0, 59), "alert_last_sent": at(10, 0, 59)}
+    assert not reminder.is_due(timer, at(10, 4, 59))
+    assert reminder.is_due(timer, at(10, 5, 0))
+    assert reminder.is_due(timer, at(10, 2), every_min=2)
+    assert not reminder.is_due(timer, at(9, 59)), "часы назад - не повод слать"
+
+
+def test_reminder_timer_file_roundtrip_and_delete():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = reminder.timer_path(Path(tmp) / "state.txt")
+        assert path.name == "state_down.txt"
+        timer = {"last_change": at(20, 0, 40), "alert_last_sent": at(20, 5, 3)}
+        assert reminder.save_timer(timer, path) is True
+        text = path.read_text(encoding="utf-8")
+        assert "last_change=2026-10-14T20:00:40\nalert_last_sent=2026-10-14T20:05:03\n" in text, text
+        assert reminder.load_timer(path) == timer
+        assert not Path(str(path) + ".tmp").exists()
+        assert reminder.save_timer(None, path) is True and not path.exists()
+        assert reminder.save_timer(None, path) is True, "удалять нечего - тоже успех"
+        assert reminder.load_timer(path) is None
+
+
+def test_reminder_bad_timer_file_is_none_with_warning():
+    # Черновик Вани 14.10 был в секундах unix: читается как сброшенный таймер.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state_down.txt"
+        for text in ("# aleting tc\nlast_change=1728901234\nalert_last_sent=1728901200",
+                     "last_change=2026-10-14T20:00:40\n", "мусор\n"):
+            path.write_text(text, encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assert reminder.load_timer(path) is None, text
+            assert "таймер не разобран" in err.getvalue(), err.getvalue()
+
+
+def test_reminder_save_timer_unwritable_returns_false():
+    with tempfile.TemporaryDirectory() as tmp:
+        blocker = Path(tmp) / "file"
+        blocker.write_text("x", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ok = reminder.save_timer({"last_change": at(1, 0), "alert_last_sent": at(1, 0)},
+                                     blocker / "state_down.txt")
+    assert ok is False and "таймер не сохранён" in err.getvalue()
 
 
 def test_alert_send_batches_returns_unsent_names():
@@ -511,10 +736,14 @@ def test_state_keep_unreported_reverts_or_drops():
 
 
 def test_alert_group_min_parameter():
-    events = [ev("down", "v1"), ev("down", "v2")]
-    assert alert.build_messages(events, group_min=2) == [
-        "🔴 Обнаружено падение:\n- Коллектор v1\n- Коллектор v2"]
-    assert len(alert.build_messages(events, group_min=GROUP_MIN_DOWN)) == 2
+    assert texts(alert.fall_batches(["v1", "v2"], group_min=2)) == [
+        "🔴 Обнаружено падение коллекторов:\n- Коллектор v1\n- Коллектор v2"]
+    assert len(alert.fall_batches(["v1", "v2"], group_min=GROUP_MIN_DOWN)) == 2
+
+
+def test_runlog_sent_line():
+    line = runlog.sent_line({"kind": "remind", "text": "t", "names": ["v7", "v8"]})
+    assert re.fullmatch(STAMP + r" sent remind v7, v8", line), line
 
 
 
@@ -557,25 +786,109 @@ def test_runlog_event_lines():
     assert runlog.event_lines([]) == []
 
 
-def line_count(path):
-    return len(path.read_text(encoding="utf-8").splitlines())
+NOW14 = datetime(2026, 10, 14, 10, 0, 0)
 
 
-def test_runlog_trims_over_slack():
+def read_lines(path):
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def test_runlog_trims_lines_older_than_week():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "runs.log"
-        lines = ["line {}".format(i) for i in range(6000)]
-        assert runlog.append(lines, path, max_lines=5000) is True
-        content = path.read_text(encoding="utf-8").splitlines()
-        assert len(content) == 5000, len(content)
-        assert content[0] == "line 1000" and content[-1] == "line 5999", (content[0], content[-1])
+        path.write_text("2026-10-06 09:00:00 run old1\n2026-10-06 23:59:00 run old2\n"
+                        "2026-10-08 00:00:00 run keep1\n2026-10-13 12:00:00 run keep2\n",
+                        encoding="utf-8")
+        assert runlog.append(["2026-10-14 10:00:00 run new"], path, now=NOW14) is True
+        assert read_lines(path) == ["2026-10-08 00:00:00 run keep1",
+                                    "2026-10-13 12:00:00 run keep2",
+                                    "2026-10-14 10:00:00 run new"]
 
 
-def test_runlog_slack_leaves_file_alone():
+def test_runlog_keeps_boundary_line_and_respects_keep_days():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "runs.log"
-        assert runlog.append(["l{}".format(i) for i in range(5400)], path, max_lines=5000)
-        assert line_count(path) == 5400, "в пределах люфта файл не переписывается"
+        # Ровно 7 суток назад: не старше срока, остаётся; старше больше чем на час запаса - уходит.
+        path.write_text("2026-10-07 08:59:00 run gone\n2026-10-07 10:00:00 run edge\n",
+                        encoding="utf-8")
+        runlog.append(["2026-10-14 10:00:00 run new"], path, now=NOW14)
+        assert read_lines(path) == ["2026-10-07 10:00:00 run edge",
+                                    "2026-10-14 10:00:00 run new"]
+        runlog.append(["2026-10-14 10:01:00 run new2"], path, now=NOW14, keep_days=3)
+        assert read_lines(path) == ["2026-10-14 10:00:00 run new",
+                                    "2026-10-14 10:01:00 run new2"]
+
+
+def test_runlog_unstamped_line_does_not_break_trim():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "runs.log"
+        path.write_text("2026-10-06 09:00:00 run old\nмусор без метки\n"
+                        "2026-10-08 00:00:00 run keep\n", encoding="utf-8")
+        assert runlog.append(["2026-10-14 10:00:00 run new"], path, now=NOW14) is True
+        assert read_lines(path) == ["2026-10-08 00:00:00 run keep", "2026-10-14 10:00:00 run new"]
+
+
+def test_runlog_unstamped_line_after_fresh_is_kept():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "runs.log"
+        path.write_text("2026-10-06 09:00:00 run old\n2026-10-08 00:00:00 run keep\nхвост\n",
+                        encoding="utf-8")
+        runlog.append(["2026-10-14 10:00:00 run new"], path, now=NOW14)
+        assert read_lines(path) == ["2026-10-08 00:00:00 run keep", "хвост",
+                                    "2026-10-14 10:00:00 run new"]
+
+
+def test_runlog_hour_slack_leaves_file_alone():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "runs.log"
+        # Первая строка старше срока на 30 минут: до часа файл не переписывается.
+        path.write_text("2026-10-07 09:30:00 run barely_old\n", encoding="utf-8")
+        runlog.append(["2026-10-14 10:00:00 run new"], path, now=NOW14)
+        assert read_lines(path) == ["2026-10-07 09:30:00 run barely_old",
+                                    "2026-10-14 10:00:00 run new"]
+        # Старше срока больше чем на час - режется.
+        path.write_text("2026-10-07 08:30:00 run old\n", encoding="utf-8")
+        runlog.append(["2026-10-14 10:00:00 run new"], path, now=NOW14)
+        assert read_lines(path) == ["2026-10-14 10:00:00 run new"]
+
+
+def make_daily_logs(tmp):
+    logs = Path(tmp) / "logs"
+    logs.mkdir()
+    names = ["collector_checker_2026-10-06.log", "collector_checker_2026-10-07.log",
+             "collector_checker_2026-10-08.log", "collector_checker_2026-10-14.log",
+             "notes.txt", "collector_checker_мусор.log"]
+    for n in names:
+        (logs / n).write_text("x", encoding="utf-8")
+    return logs
+
+
+def test_prune_daily_logs_removes_only_old_daily_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = make_daily_logs(tmp)
+        assert runlog.prune_daily_logs(logs, today=date(2026, 10, 14)) == 1
+        assert sorted(p.name for p in logs.iterdir()) == [
+            "collector_checker_2026-10-07.log", "collector_checker_2026-10-08.log",
+            "collector_checker_2026-10-14.log", "collector_checker_мусор.log", "notes.txt"]
+
+
+def test_prune_daily_logs_keep_days_and_missing_dir():
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = make_daily_logs(tmp)
+        assert runlog.prune_daily_logs(logs, today=date(2026, 10, 14), keep_days=1) == 3
+        assert (logs / "collector_checker_2026-10-14.log").exists()
+        assert (logs / "notes.txt").exists()
+        assert runlog.prune_daily_logs(Path(tmp) / "нет", today=date(2026, 10, 14)) == 0
+
+
+def test_prune_daily_logs_os_error_is_warning():
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = make_daily_logs(tmp)
+        err = io.StringIO()
+        with mock.patch.object(runlog.os, "remove", side_effect=PermissionError("нет прав")):
+            with contextlib.redirect_stderr(err):
+                assert runlog.prune_daily_logs(logs, today=date(2026, 10, 14)) == 0
+        assert "не удалён" in err.getvalue()
 
 
 def test_runlog_append_empty_makes_no_file():
@@ -699,10 +1012,10 @@ def test_run_failed_send_keeps_state_for_retry_and_returns_0():
             send_batches=lambda batches, sender: ["v7"],
             save_state=lambda st, path: saved.append(st) or True)
         assert "unsent v7" in log.read_text(encoding="utf-8")
-    # Сбой канала - не сбой скрипта: код 0, а v7 выпадает из состояния,
-    # чтобы следующий прогон увидел падение заново и отправил сообщение.
+    # Сбой канала - не сбой скрипта: код 0, а v7 остаётся несообщённым (pending),
+    # и следующий прогон отправит падение снова.
     assert code == 0, (code, err)
-    assert saved == [{}], saved
+    assert [{n: e["status"] for n, e in st.items()} for st in saved] == [{"v7": "pending"}], saved
     assert "не отправлено: v7" in err, err
 
 

@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import main  # noqa: E402
+from modules.config import now_msk  # noqa: E402
 from modules.probe import checker as probe  # noqa: E402
 
 TIMEOUT = 2
@@ -110,14 +111,20 @@ def sent(out):
 
 
 def run_case(behavior, *, state_text=None, overrides=None, collectors_text=None,
-             state_path=None):
-    """Один прогон main.run во временной папке. overrides: {имя: полный url}."""
+             state_path=None, timer_text=None, prepare=None):
+    """Один прогон main.run во временной папке. overrides: {имя: полный url};
+    timer_text - готовый state_down.txt; prepare(tmp) - что угодно до прогона."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         runs_log = tmp / "runs.log"
         state = tmp / "state.txt" if state_path is None else state_path(tmp)
+        timer = state.with_name("state_down.txt")
         if state_text is not None:
             state.write_text(state_text, encoding="utf-8")
+        if timer_text is not None:
+            timer.write_text(timer_text, encoding="utf-8")
+        if prepare is not None:
+            prepare(tmp)
         with collector_server(behavior) as server:
             base = "http://127.0.0.1:{}".format(server.server_address[1])
             if collectors_text is None:
@@ -135,24 +142,36 @@ def run_case(behavior, *, state_text=None, overrides=None, collectors_text=None,
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     code = main.run(main.parse_args(
                         ["--no-notify", "--collectors", str(collectors), "--state", str(state),
-                         "--runlog", str(runs_log)]))
+                         "--runlog", str(runs_log),
+                         "--logs", str(tmp / "logs")]))
             finally:
                 probe.RETRY_PAUSE, probe.REQUEST_TIMEOUT = saved
             return {
                 "code": code, "out": out.getvalue(), "err": err.getvalue(),
                 "state": read_state(state) if state.exists() else None,
+                "state_text": state.read_text(encoding="utf-8") if state.exists() else None,
                 "state_exists": state.exists(),
+                "timer": timer.read_text(encoding="utf-8") if timer.is_file() else None,
                 "runlog": runs_log.read_text(encoding="utf-8") if runs_log.exists() else "",
                 "hits": dict(server.hits),
             }
 
 
-def state_text_all_up_except(down_name, since):
+def state_text_all_up_except(down_name, since, *more_down):
     lines = ["# collector status since(MSK)"]
     for n in NAMES:
-        status = "down" if n == down_name else "up"
+        status = "down" if n == down_name or n in more_down else "up"
         lines.append("{} {} {}".format(n, status, since.isoformat(timespec="seconds")))
     return "\n".join(lines) + "\n"
+
+
+def timer_text(minutes_since_fall, minutes_since_sent):
+    """Таймер относительно настоящего времени МСК. Падение 62 минуты назад: отметки
+    на 60 и 65 минутах, переход минуты во время теста их не задевает."""
+    now = now_msk().replace(microsecond=0)
+    return "last_change={}\nalert_last_sent={}\n".format(
+        (now - timedelta(minutes=minutes_since_fall)).isoformat(),
+        (now - timedelta(minutes=minutes_since_sent)).isoformat())
 
 
 def an_hour_ago():
@@ -184,15 +203,78 @@ def test_ac2_one_down():
     assert r["state"]["v7"][1] > an_hour_ago() + timedelta(minutes=30), r["state"]["v7"]
 
 
-def test_ac3_still_down_is_silent():
+def test_ac14_still_down_between_marks_is_silent():
     since = an_hour_ago()
-    r = run_case({"v7": 503}, state_text=state_text_all_up_except("v7", since))
+    before = timer_text(62, 0)
+    r = run_case({"v7": 503}, state_text=state_text_all_up_except("v7", since),
+                 timer_text=before)
     assert r["code"] == 0, r["err"]
     assert sent(r["out"]) == [], sent(r["out"])
     assert "Сообщать не о чем." in r["out"], r["out"]
     assert r["state"]["v7"] == ("down", since), r["state"]["v7"]
     assert "event still_down v7" in r["runlog"], r["runlog"]
     assert "event down v7" not in r["runlog"]
+    assert r["timer"].endswith(before), "таймер без отправки не меняется"
+
+
+def test_ac14_reminder_on_mark():
+    r = run_case({"v7": 503}, state_text=state_text_all_up_except("v7", an_hour_ago()),
+                 timer_text=timer_text(62, 7))
+    assert r["code"] == 0, r["err"]
+    assert sent(r["out"]) == ["🔴 Коллектор v7 всё ещё не работает"], sent(r["out"])
+    assert "sent remind v7" in r["runlog"], r["runlog"]
+    sent_at = [l for l in r["timer"].splitlines() if l.startswith("alert_last_sent=")][0]
+    moved = datetime.fromisoformat(sent_at.split("=", 1)[1])
+    assert now_msk() - moved < timedelta(minutes=1), r["timer"]
+
+
+def test_ac15_new_fall_waits_then_joins_reminder():
+    state_text = state_text_all_up_except("v7", an_hour_ago())
+    r = run_case({"v7": 503, "v8": 503}, state_text=state_text, timer_text=timer_text(62, 0))
+    assert r["code"] == 0, r["err"]
+    assert sent(r["out"]) == [], sent(r["out"])
+    assert r["state"]["v8"][0] == "pending" and "event down v8" in r["runlog"]
+
+    r = run_case({"v7": 503, "v8": 503}, state_text=r["state_text"], timer_text=timer_text(62, 7))
+    assert sent(r["out"]) == ["🔴 Коллектор v7 всё ещё не работает",
+                              "🔴 Коллектор v8 всё ещё не работает"], sent(r["out"])
+    assert r["state"]["v8"][0] == "down"
+
+
+def test_ac17_all_up_removes_timer_file():
+    r = run_case({}, state_text=state_text_all_up_except("v7", an_hour_ago()),
+                 timer_text=timer_text(62, 0))
+    assert r["code"] == 0, r["err"]
+    assert sent(r["out"]) == ["🟢 Коллектор v7 снова работает"], sent(r["out"])
+    assert r["timer"] is None, r["timer"]
+
+
+def test_ac17_lost_timer_reminds_now_and_opens_it():
+    r = run_case({"v7": 503}, state_text=state_text_all_up_except("v7", an_hour_ago()))
+    assert r["code"] == 0, r["err"]
+    assert sent(r["out"]) == ["🔴 Коллектор v7 всё ещё не работает"], sent(r["out"])
+    assert "last_change=" in r["timer"] and "alert_last_sent=" in r["timer"], r["timer"]
+
+
+def test_ac17_draft_timer_in_unix_seconds_is_reset_not_fatal():
+    draft = "# aleting tc\nlast_change=1728901234\nalert_last_sent=1728901200"
+    r = run_case({"v7": 503}, state_text=state_text_all_up_except("v7", an_hour_ago()),
+                 timer_text=draft)
+    assert r["code"] == 0, r["err"]
+    assert "таймер не разобран" in r["err"], r["err"]
+    assert sent(r["out"]) == ["🔴 Коллектор v7 всё ещё не работает"], sent(r["out"])
+
+
+def test_unsaveable_timer_gives_code_1_after_sending():
+    def timer_is_a_directory(tmp):
+        (tmp / "state_down.txt").mkdir()
+
+    r = run_case({"v7": 503}, state_text=state_text_all_up_except(None, an_hour_ago()),
+                 prepare=timer_is_a_directory)
+    assert r["code"] == 1
+    assert sent(r["out"]) == ["🔴 Обнаружено падение, v7"], sent(r["out"])
+    assert "таймер не сохранён" in r["err"], r["err"]
+    assert r["state"]["v7"][0] == "down", "state.txt пишется раньше таймера"
 
 
 def test_ac4_recovery():
@@ -207,7 +289,7 @@ def test_ac4_recovery():
 def test_ac5_group_message_from_three():
     r = run_case({"v1": 503, "v3": 503, "v7": 503})
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == ["🔴 Обнаружено падение:"], sent(r["out"])
+    assert sent(r["out"]) == ["🔴 Обнаружено падение коллекторов:"], sent(r["out"])
     assert "- Коллектор v1\n- Коллектор v3\n- Коллектор v7" in r["out"], r["out"]
     assert [n for n, (s, _) in r["state"].items() if s == "down"] == ["v1", "v3", "v7"]
 
@@ -216,14 +298,16 @@ def test_ac5_group_message_from_three():
     assert not any("падение:" in m for m in sent(r["out"]))
 
 
-def test_ac6_retry_hides_blink():
-    r = run_case({"v2": "flaky"})
+def test_ac13_single_attempt_blink_gives_down_then_up():
+    r = run_case({"v2": "flaky"}, state_text=state_text_all_up_except(None, an_hour_ago()))
     assert r["code"] == 0, r["err"]
-    assert sent(r["out"]) == [], sent(r["out"])
-    assert r["hits"]["v2"] == 2, r["hits"]
-    assert any(l.startswith("v2 ") and "2 попытки" in l and " ok " in l
-               for l in r["out"].splitlines()), r["out"]
-    assert "v2 ok (2 попытки)" in r["runlog"], r["runlog"]
+    assert sent(r["out"]) == ["🔴 Обнаружено падение, v2"], sent(r["out"])
+    assert r["hits"]["v2"] == 1, r["hits"]
+    assert "v2 HTTP 503 (1 попытка)" in r["runlog"], r["runlog"]
+
+    r = run_case({}, state_text=r["state_text"])
+    assert r["code"] == 0, r["err"]
+    assert sent(r["out"]) == ["🟢 Коллектор v2 снова работает"], sent(r["out"])
     assert r["state"]["v2"][0] == "up"
 
 
@@ -236,8 +320,8 @@ def test_ac7_connection_refused_and_timeout():
     assert sent(r["out"]) == ["🔴 Обнаружено падение, v4", "🔴 Обнаружено падение, v5"], sent(r["out"])
     assert r["state"]["v4"][0] == "down" and r["state"]["v5"][0] == "down"
     run_line = [l for l in r["runlog"].splitlines() if " run " in l][0]
-    assert "v4 connection (3 попытки)" in run_line, run_line
-    assert "v5 timeout (3 попытки)" in run_line, run_line
+    assert "v4 connection (1 попытка)" in run_line, run_line
+    assert "v5 timeout (1 попытка)" in run_line, run_line
     for text in sent(r["out"]):
         assert "connection" not in text and "timeout" not in text
 

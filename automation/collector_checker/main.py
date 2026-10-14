@@ -9,14 +9,17 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 from typing import Callable, List, Optional
 
-from modules.alerting import (apply_results, attempts_word, build_batches,
-                              event_lines, keep_unreported, load_state, make_sender,
-                              printing_sender, run_line, runlog_append, save_state,
-                              send_batches, unsent_line)
-from modules.config import (ATTEMPTS, COLLECTORS_FILE, REQUEST_TIMEOUT, RETRY_PAUSE,
-                            RUNLOG_FILE, STATE_FILE, TELEGRAM_CHAT_VAR, TELEGRAM_TOKEN_VAR)
+from modules.alerting import (apply_results, attempts_word, delivered, drop_stale, event_lines,
+                              load_state, load_timer, make_sender, plan_batches,
+                              printing_sender, prune_daily_logs, run_line, runlog_append, save_state,
+                              save_timer, send_batches, sent_line, settle, timer_path,
+                              unsent_line)
+from modules.config import (ATTEMPTS, COLLECTORS_FILE, LOGS_DIR, REQUEST_TIMEOUT, RETRY_PAUSE,
+                            RUNLOG_FILE, STATE_FILE, TELEGRAM_CHAT_VAR, TELEGRAM_TOKEN_VAR,
+                            now_msk)
 from modules.probe import check_all, reason_of
 from modules.sources import BadCollectorLine, EmptyCollectorList, load_collectors
 
@@ -32,6 +35,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="файл состояния, по умолчанию {}".format(STATE_FILE))
     parser.add_argument("--runlog", default=None, metavar="ФАЙЛ",
                         help="журнал прогонов, по умолчанию {}".format(RUNLOG_FILE))
+    parser.add_argument("--logs", default=LOGS_DIR, metavar="ДИР", type=Path,
+                        help="папка суточных логов, по умолчанию {}".format(LOGS_DIR))
     return parser.parse_args(argv)
 
 
@@ -54,6 +59,7 @@ def run(args: argparse.Namespace) -> int:
     sender = choose_sender(args.no_notify)
     if sender is None:
         return 1
+    prune_daily_logs(args.logs)
     try:
         collectors = load_collectors(args.collectors)
     except (EmptyCollectorList, BadCollectorLine, FileNotFoundError,
@@ -66,6 +72,10 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     previous = load_state(args.state)
+    timer_file = timer_path(args.state or STATE_FILE)
+    timer = drop_stale(load_timer(timer_file), previous)
+    # Отметки таймера считаются по минуте запуска, а не по концу проверок.
+    now = now_msk()
     # Результаты печатаются после всех попыток; строка показывает, что прогон идёт.
     print("Проверяю {} коллекторов, при неответе до {} с...".format(
         len(collectors), ATTEMPTS * REQUEST_TIMEOUT + (ATTEMPTS - 1) * RETRY_PAUSE), flush=True)
@@ -76,23 +86,25 @@ def run(args: argparse.Namespace) -> int:
             len(r["attempts"]), attempts_word(len(r["attempts"])),
             r["attempts"][-1]["elapsed_ms"] if r["attempts"] else "-"))
 
-    state, events = apply_results(previous, results)
-    batches = build_batches(events)
+    state, events = apply_results(previous, results, now)
+    batches = plan_batches(state, events, timer, now)
     unsent = send_batches(batches, sender)
+    # Недоставленное отправится в следующем прогоне. Сбой канала не даёт код 1.
+    state, timer = settle(state, previous, timer, batches, unsent, now)
     if not batches:
         print("Сообщать не о чем.")
     lines = [run_line(results)] + event_lines(events)
+    lines += [sent_line(b) for b in batches if delivered(b, unsent)]
     if unsent:
-        # Недоставленное отправится в следующем прогоне. Сбой канала не даёт код 1.
-        state = keep_unreported(state, previous, unsent)
         lines.append(unsent_line(unsent))
         print("не отправлено: {}; повтор в следующем прогоне".format(", ".join(unsent)),
               file=sys.stderr)
 
-    if not runlog_append(lines, path=args.runlog):
+    if not runlog_append(lines, path=args.runlog, now=now):
         print("журнал не записан", file=sys.stderr)
 
-    saved = save_state(state, args.state)
+    # Таймер пишется вторым: без сохранённого state.txt он бы указывал на чужое прошлое.
+    saved = save_state(state, args.state) and save_timer(timer, timer_file)
     print("Проверено {}, лежит {}, сообщений {}, не отправлено {}".format(
         len(results), sum(1 for r in results if not r["ok"]), len(batches), len(unsent)))
     return 0 if saved else 1
