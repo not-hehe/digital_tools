@@ -1,11 +1,16 @@
+import os
+import re
 import sys
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
-from ..config import RUNLOG_FILE, RUNLOG_MAX_LINES, now_msk
+from ..config import LOG_KEEP_DAYS, RUNLOG_FILE, now_msk
 from ..probe import reason_of
 
 _FMT = "%Y-%m-%d %H:%M:%S"
+_TRIM_SLACK = timedelta(hours=1)
+_DAILY = re.compile(r"collector_checker_(\d{4}-\d{2}-\d{2})\.log")
 
 
 def attempts_word(n: int) -> str:
@@ -40,11 +45,11 @@ def event_lines(events: List[dict]) -> List[str]:
         for e in events]
 
 
-def append(lines: List[str], path: Optional[Path] = None,
-           max_lines: Optional[int] = None) -> bool:
+def append(lines: List[str], path: Optional[Path] = None, now: Optional[datetime] = None,
+           keep_days: Optional[int] = None) -> bool:
     """False при ошибке записи; прогон продолжается."""
     path = RUNLOG_FILE if path is None else path
-    max_lines = RUNLOG_MAX_LINES if max_lines is None else max_lines
+    keep_days = LOG_KEEP_DAYS if keep_days is None else keep_days
     if not lines:
         return True
     try:
@@ -53,24 +58,71 @@ def append(lines: List[str], path: Optional[Path] = None,
     except OSError as e:
         print("журнал не записан ({}): {}".format(path, e), file=sys.stderr)
         return False
-    _trim(path, max_lines)
+    _trim(path, now_msk() if now is None else now, keep_days)
     return True
 
 
-def _trim(path: Path, max_lines: int) -> None:
-    if max_lines <= 0:
-        return
-    # Запас, чтобы не переписывать файл на каждом прогоне.
-    slack = max(1, max_lines // 10)
+def _stamp(line: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(line[:19], _FMT)
+    except ValueError:
+        return None
+
+
+def _trim(path: Path, now: datetime, keep_days: int) -> None:
+    cutoff = now - timedelta(days=keep_days)
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.readlines()
-        if len(lines) <= max_lines + slack:
+        # Запас в час: иначе файл переписывался бы каждую минуту. Первая строка без метки
+        # не должна вечно блокировать обрезку, поэтому смотрим на первую с меткой.
+        first = next((t for t in map(_stamp, lines) if t is not None), None)
+        if first is None or first >= cutoff - _TRIM_SLACK:
             return
+        # Срез идёт до первой свежей строки: строки без метки среди старых уходят с ними.
+        keep_from = next((i for i, line in enumerate(lines)
+                          if (_stamp(line) or datetime.min) >= cutoff), len(lines))
+        # Строка без метки не может быть «свежей»: после первой свежей не трогаем ничего.
         with open(path, "w", encoding="utf-8") as f:
-            f.writelines(lines[-max_lines:])
-    except OSError as e:
+            f.writelines(lines[keep_from:])
+    except (OSError, UnicodeDecodeError) as e:
         print("журнал не подрезан ({}): {}".format(path, e), file=sys.stderr)
+
+
+def prune_daily_logs(logs_dir: Path, today: Optional[date] = None,
+                     keep_days: Optional[int] = None) -> int:
+    """Удаляет суточные логи старше срока; чужие файлы не трогает. Возвращает число удалённых."""
+    today = date.today() if today is None else today
+    keep_days = LOG_KEEP_DAYS if keep_days is None else keep_days
+    cutoff = today - timedelta(days=keep_days)
+    removed = 0
+    try:
+        names = sorted(os.listdir(str(logs_dir)))
+    except FileNotFoundError:
+        return 0   # папки ещё нет - нечего подрезать
+    except OSError as e:
+        print("логи не подрезаны ({}): {}".format(logs_dir, e), file=sys.stderr)
+        return 0
+    for name in names:
+        m = _DAILY.fullmatch(name)
+        if m is None:
+            continue
+        try:
+            day = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if day >= cutoff:
+            continue
+        try:
+            os.remove(os.path.join(str(logs_dir), name))
+            removed += 1
+        except OSError as e:
+            print("лог не удалён ({}): {}".format(name, e), file=sys.stderr)
+    return removed
+
+
+def sent_line(batch: dict) -> str:
+    return "{} sent {} {}".format(now_msk().strftime(_FMT), batch["kind"], ", ".join(batch["names"]))
 
 
 def unsent_line(names: List[str]) -> str:

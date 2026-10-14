@@ -1,42 +1,49 @@
-"""Тексты сообщений и отправка списка."""
+"""Тексты сообщений и отправка списка. Кому и когда писать, решает reminder."""
 
 from typing import Callable, List, Optional
 
 from ..config import GROUP_MIN_DOWN
-from .state import EVENT_DOWN, EVENT_UP
 
 DOWN_MARK = "\U0001F534"   # красный кружок
 UP_MARK = "\U0001F7E2"     # зелёный кружок
 
+KIND_FALL = "fall"
+KIND_REMIND = "remind"
+KIND_UP = "up"
 
-def build_batches(events: List[dict], group_min: Optional[int] = None) -> List[dict]:
-    """Сообщения с именами коллекторов; по именам неотправленное повторяется в следующем
-    прогоне. Одно сообщение на падение и одно на подъём, still_down не сообщается.
-    От group_min событий за прогон формируется одно сообщение списком.
-    Сначала падения, затем подъёмы."""
+
+def _batches(kind: str, names: List[str], group_min: Optional[int],
+             single: str, header: str) -> List[dict]:
+    """От group_min имён одно сообщение списком, меньше - по одному."""
     group_min = GROUP_MIN_DOWN if group_min is None else group_min
-    down = [e["name"] for e in events if e["event"] == EVENT_DOWN]
-    up = [e["name"] for e in events if e["event"] == EVENT_UP]
-
-    batches = []
-    if len(down) >= group_min:
-        batches.append({"text": "{} Обнаружено падение:\n{}".format(
-            DOWN_MARK, "\n".join("- Коллектор {}".format(name) for name in down)), "names": down})
-    else:
-        batches.extend({"text": "{} Обнаружено падение, {}".format(DOWN_MARK, name), "names": [name]}
-                       for name in down)
-    if len(up) >= group_min:
-        batches.append({"text": "{} Коллектор снова работает:\n{}".format(
-            UP_MARK, "\n".join("- Коллектор {}".format(name) for name in up)), "names": up})
-    else:
-        batches.extend({"text": "{} Коллектор {} снова работает".format(UP_MARK, name), "names": [name]}
-                       for name in up)
-    return batches
+    if not names:
+        return []
+    if len(names) >= group_min:
+        text = "{}\n{}".format(header, "\n".join("- Коллектор {}".format(n) for n in names))
+        return [{"kind": kind, "text": text, "names": list(names)}]
+    return [{"kind": kind, "text": single.format(name), "names": [name]} for name in names]
 
 
-def build_messages(events: List[dict], group_min: Optional[int] = None) -> List[str]:
-    # Только тексты, для тестов.
-    return [b["text"] for b in build_batches(events, group_min)]
+def fall_batches(names: List[str], group_min: Optional[int] = None) -> List[dict]:
+    return _batches(KIND_FALL, names, group_min,
+                    DOWN_MARK + " Обнаружено падение, {}",
+                    DOWN_MARK + " Обнаружено падение коллекторов:")
+
+
+def remind_batches(names: List[str], group_min: Optional[int] = None) -> List[dict]:
+    return _batches(KIND_REMIND, names, group_min,
+                    DOWN_MARK + " Коллектор {} всё ещё не работает",
+                    DOWN_MARK + " Коллекторы всё ещё не работают:")
+
+
+def up_batches(names: List[str], group_min: Optional[int] = None) -> List[dict]:
+    return _batches(KIND_UP, names, group_min,
+                    UP_MARK + " Коллектор {} снова работает",
+                    UP_MARK + " Коллектор снова работает:")
+
+
+def delivered(batch: dict, unsent: List[str]) -> bool:
+    return not set(unsent).intersection(batch["names"])
 
 
 def send_batches(batches: List[dict], sender: Callable[[str], bool]) -> List[str]:
