@@ -8,7 +8,7 @@ from typing import List, Optional
 
 import requests
 
-from ..config import (ATTEMPT_DEADLINE, ATTEMPTS, HEALTHY_CODE, MAX_WORKERS, REQUEST_TIMEOUT,
+from ..config import (ATTEMPT_DEADLINE, ATTEMPTS, HEALTHY_CODE, REQUEST_TIMEOUT,
                      RETRY_PAUSE, USER_AGENT, now_msk)
 from .failures import FAIL_OTHER, FAIL_TIMEOUT, classify_exception
 
@@ -86,10 +86,11 @@ def check_collector(collector: dict, *, timeout: Optional[int] = None,
 
 
 def check_all(collectors: List[dict], max_workers: Optional[int] = None, **kwargs) -> List[dict]:
-    """Результаты в порядке конфига."""
-    max_workers = MAX_WORKERS if max_workers is None else max_workers
+    """Результаты в порядке конфига. По умолчанию поток на цель: глухие цели
+    ждут таймаут одновременно, и прогон укладывается в одну попытку."""
     if not collectors:
         return []
+    max_workers = len(collectors) if max_workers is None else max_workers
 
     def run_one(collector):
         # Сессия на поток: Session не потокобезопасна.

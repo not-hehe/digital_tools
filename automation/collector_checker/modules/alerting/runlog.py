@@ -83,8 +83,11 @@ def _trim(path: Path, now: datetime, keep_days: int) -> None:
         keep_from = next((i for i, line in enumerate(lines)
                           if (_stamp(line) or datetime.min) >= cutoff), len(lines))
         # Строка без метки не может быть «свежей»: после первой свежей не трогаем ничего.
-        with open(path, "w", encoding="utf-8") as f:
+        # Через .tmp, как state.txt: сбой посреди перезаписи не теряет журнал.
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(lines[keep_from:])
+        os.replace(tmp, path)
     except (OSError, UnicodeDecodeError) as e:
         print("журнал не подрезан ({}): {}".format(path, e), file=sys.stderr)
 

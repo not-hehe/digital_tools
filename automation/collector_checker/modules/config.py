@@ -20,7 +20,6 @@ ATTEMPTS = 1
 RETRY_PAUSE = 10
 # Предел длительности одной попытки; таймаут выше действует между байтами.
 ATTEMPT_DEADLINE = 30
-MAX_WORKERS = 15   # все коллекторы параллельно
 USER_AGENT = "collector-checker/1.0"
 
 HEALTHY_CODE = 200
