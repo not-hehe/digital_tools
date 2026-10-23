@@ -10,6 +10,7 @@
 
 import json
 import logging
+import re
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -25,7 +26,7 @@ from modules.config import CONFIRM_FAILS
 from modules.probe import failures as f
 from modules.probe.checker import (blank_result, check_all, check_domain,
                                    is_healthy, reason_of)
-from modules.sources import targets as tg
+from modules.sources import sheet as sh, targets as tg
 from modules.urls import label_of, looks_like_url, normalize
 
 # ---------------------------------------------------------------------------
@@ -328,7 +329,24 @@ def test_build_alert_groups_largest_first():
                 for i in range(3)]
                + [bad_result("h.example.com", code=404)])
     text = alert.build_alert(results)
-    assert text.index(f.failure_label(f.FAIL_TIMEOUT)) < text.index("HTTP 404")
+    assert text.index("Тайм-аут - 3") < text.index("HTTP 404 - 1")
+
+
+def test_alert_explains_reason():
+    results = [bad_result("t.example.com", kind=f.FAIL_TIMEOUT),
+               bad_result("s.example.com", kind=f.FAIL_TLS),
+               bad_result("h.example.com", code=503),
+               bad_result("x.example.com", code=418)]
+    text = alert.build_alert(results)
+    assert "  не открылся: сервер не ответил за 5 секунд" in text
+    assert "TLS - 1\n  не открылся: защищённое соединение" in text
+    assert "HTTP 503 - 1\n  открылся с ошибкой: сервер временно недоступен" in text
+    assert "HTTP 418 - 1\n  открылся с ошибкой: сервер отказал в запросе" in text
+    assert f.failure_label(f.FAIL_TIMEOUT) not in text
+    # Причина, которой нет в словаре, выводится как есть и без пояснения.
+    text = alert.build_event_alert(down_event(1, reason="что-то новое"),
+                                   checked=100)
+    assert "что-то новое - 1\n  d0.unknown.example.com" in text
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +591,8 @@ def test_event_alert_separates_lone_and_group():
     text = alert.build_event_alert(group + lone, checked=100)
     assert "Упали: 3" in text and "начните с машины проверки" in text
     assert "Не отвечают дольше 16 часов: 1" in text
-    assert "lone.example.com - HTTP 503 (с 2026-10-04 20:00)" in text
+    assert ("lone.example.com - HTTP 503 (с 2026-10-04 20:00)\n"
+            "    открылся с ошибкой: сервер временно недоступен") in text
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +670,247 @@ def test_no_webhook_address_in_code():
         source = path.read_text(encoding="utf-8")
         assert "/hooks/" not in source, "адрес вебхука в {}".format(
             path.relative_to(root))
+        assert not _SHEET_ID_RE.search(source), "ссылка на таблицу в {}".format(
+            path.relative_to(root))
+
+
+_SHEET_ID_RE = re.compile(r"/spreadsheets/d/[A-Za-z0-9_-]{20,}")
+
+
+# ---------------------------------------------------------------------------
+# Google-таблица
+# ---------------------------------------------------------------------------
+
+SHEET = "https://docs.google.com/spreadsheets/d/TESTID/edit?hl=ru&gid=7#gid=7"
+
+
+class _FakeHeaders:
+    def __init__(self, ctype):
+        self.ctype = ctype
+
+    def get_content_type(self):
+        return self.ctype
+
+
+class _FakeResponse:
+    def __init__(self, body, ctype="text/csv"):
+        self.body, self.headers = body, _FakeHeaders(ctype)
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _opener(body=b"", ctype="text/csv", error=None):
+    calls = []
+
+    def opener(request, timeout=None):
+        calls.append(request.full_url)
+        if error is not None:
+            raise error
+        return _FakeResponse(body, ctype)
+    opener.calls = calls
+    return opener
+
+
+def _csv(*rows):
+    return "\n".join(",".join(r) for r in rows).encode("utf-8")
+
+
+def _sheet_reason(**kw):
+    try:
+        sh.read_sheet(SHEET, opener=_opener(**kw))
+    except sh.SheetUnavailable as e:
+        return str(e)
+    raise AssertionError("ожидался SheetUnavailable")
+
+
+def test_sheet_export_url_keeps_gid():
+    assert sh.export_url(SHEET) == ("https://docs.google.com/spreadsheets/d/"
+                                    "TESTID/export?format=csv&gid=7")
+    assert sh.export_url("https://docs.google.com/spreadsheets/d/X1/edit"
+                         ).endswith("/d/X1/export?format=csv&gid=0")
+    try:
+        sh.export_url("https://example.com/table")
+    except sh.SheetUnavailable as e:
+        assert "не похожа на Google-таблицу" in str(e)
+    else:
+        raise AssertionError("чужая ссылка должна давать SheetUnavailable")
+
+
+def test_sheet_failures_are_plain_words():
+    import socket
+    import urllib.error
+    not_found = urllib.error.HTTPError(SHEET, 404, "Not Found", {}, None)
+    assert "не найдена (404)" in _sheet_reason(error=not_found)
+    forbidden = urllib.error.HTTPError(SHEET, 403, "Forbidden", {}, None)
+    assert "таблица закрыта" in _sheet_reason(error=forbidden)
+    # Закрытая таблица отдаёт страницу входа, а не ошибку.
+    assert "таблица закрыта" in _sheet_reason(body=b"<html>", ctype="text/html")
+    assert "не ответил за 30 секунд" in _sheet_reason(error=socket.timeout())
+    no_net = urllib.error.URLError("nodename nor servname provided")
+    assert "нет связи с docs.google.com" in _sheet_reason(error=no_net)
+    assert _sheet_reason(body=b"") == "таблица пуста"
+    assert 'нет колонки "внешний"' in _sheet_reason(
+        body=_csv(["ошибки", "внутренний"], ["a.example.com", "b.example.com"]))
+
+
+def test_sheet_columns_by_header_prefix():
+    body = _csv(["Внешний контур", "ОШИБКИ", "внутренний"],
+                ["e1.example.com", "x1.example.com", "i1.example.com"],
+                ["e2.example.com", "", "i2.example.com"],
+                ["", "x2.example.com", ""])
+    opener = _opener(body=body)
+    cols = sh.read_sheet(SHEET, opener=opener)
+    assert cols == {"external": ["e1.example.com", "e2.example.com"],
+                    "errors": ["x1.example.com", "x2.example.com"],
+                    "internal": ["i1.example.com", "i2.example.com"]}
+    assert opener.calls == [sh.export_url(SHEET)]
+
+
+def test_contour_switch():
+    assert sh.contour_column(1) == "external"
+    assert sh.contour_column("2") == "internal"
+    for bad in ("3", "", "внешний", None):
+        try:
+            sh.contour_column(bad)
+        except ValueError as e:
+            assert "1 (внешний) или 2 (внутренний)" in str(e)
+        else:
+            raise AssertionError("переключатель {!r} должен давать ошибку".format(bad))
+
+
+_SHEET_BODY = _csv(["ошибки", "внутренний", "внешний"],
+                   ["dead.example.com", "in.example.com", "out.example.com"],
+                   ["both.example.com", "", "both.example.com"],
+                   ["нет", "", "уточняется"])
+
+
+def test_load_from_sheet_contour_first_and_junk_skipped():
+    loaded = tg.load_from_sheet(SHEET, contour=1, opener=_opener(body=_SHEET_BODY))
+    got = {t["label"]: (t["contour"], t["known_bad"]) for t in loaded["targets"]}
+    assert got == {"out.example.com": ("external", False),
+                   "both.example.com": ("external", False),
+                   "dead.example.com": ("external", True)}
+    assert loaded["source"] == "sheet" and loaded["known_bad"] == 1
+    assert loaded["counts"]["external"] == 2
+    assert sorted(loaded["skipped"]) == ["нет", "уточняется"]
+
+    inner = tg.load_from_sheet(SHEET, contour=2, opener=_opener(body=_SHEET_BODY))
+    assert {t["label"] for t in inner["targets"] if not t["known_bad"]} == {
+        "in.example.com"}
+
+
+def test_load_from_sheet_empty_contour_is_sheet_failure():
+    body = _csv(["ошибки", "внутренний", "внешний"],
+                ["dead.example.com", "in.example.com", "нет"])
+    try:
+        tg.load_from_sheet(SHEET, contour=1, opener=_opener(body=body))
+    except sh.SheetUnavailable as e:
+        assert 'в колонке "внешний" нет ни одного адреса' in str(e)
+    else:
+        raise AssertionError("пустой контур должен давать SheetUnavailable")
+
+
+def _known_bad(label, ok):
+    r = (ok_result if ok else bad_result)(label, contour="external",
+                                          **({} if ok else {"kind": f.FAIL_TIMEOUT}))
+    r["known_bad"] = True
+    return r
+
+
+def test_known_bad_silent_until_revived_then_normal_rules():
+    state = st.empty_state()
+    for _ in range(10):
+        state, events = st.apply_results(state, [_known_bad("dead.example.com", False)])
+        state, alerts = st.pick_alerts(state, events,
+                                       now=datetime.now() + timedelta(days=3))
+        assert events == [] and alerts == []
+    assert state["domains"]["dead.example.com"]["reported"] is True
+
+    state, events = st.apply_results(state, [_known_bad("dead.example.com", True)])
+    state, alerts = st.pick_alerts(state, events)
+    assert [a.get("revived") for a in alerts] == [True]
+    text = alert.build_event_alert(alerts, checked=10)
+    assert ('🟢 Ожили из списка ошибок: 1\n  dead.example.com\n'
+            'Перенесите их в таблице из колонки "ошибки" в "внешний".') in text
+    assert "Поднялись" not in text
+
+    # Таблицу ещё не поправили, сайт по-прежнему в колонке ошибок - но живёт
+    # уже по обычным правилам: подтверждение тремя прогонами, затем 16 часов.
+    for i in range(CONFIRM_FAILS):
+        state, events = st.apply_results(state, [_known_bad("dead.example.com", False)])
+    assert [e["event"] for e in events] == ["down"]
+    state, alerts = st.pick_alerts(state, events)
+    assert alerts == []
+    state, alerts = st.pick_alerts(state, [],
+                                   now=datetime.now() + timedelta(hours=17))
+    assert [a["alert"] for a in alerts] == ["lone"]
+    state, events = st.apply_results(state, [_known_bad("dead.example.com", True)])
+    state, alerts = st.pick_alerts(state, events)
+    assert [(a["event"], a.get("revived")) for a in alerts] == [("up", None)]
+
+
+def test_revived_block_is_not_hidden_by_guard():
+    fell = [dict(e, alert="group") for e in down_event(60)]
+    revived = [{"event": "up", "label": "dead.example.com", "revived": True,
+                "reported": True, "contour": "internal"}]
+    text = alert.build_event_alert(fell + revived, checked=100)
+    assert "Похоже, дело в самом чекере" in text
+    assert 'Ожили из списка ошибок: 1\n  dead.example.com' in text
+    assert 'в "внутренний"' in text
+
+
+def test_manual_summary_and_runlog_skip_known_bad_names():
+    results = [bad_result("down.example.com", code=503),
+               _known_bad("dead.example.com", False),
+               _known_bad("back.example.com", True)]
+    text = alert.build_alert(results)
+    assert "проблемных 1 из 1" in text
+    assert "dead.example.com" not in text
+    assert "Ожили из списка ошибок: 1\n  back.example.com" in text
+    line = rl.run_line(results)
+    assert "не ответили 2 (из списка ошибок 1): down.example.com (HTTP 503)" in line
+    assert "dead.example.com" not in line
+
+
+def test_sheet_alert_once_then_recovery():
+    import main as entry
+    tmp = Path(tempfile.mkdtemp())
+    sent = []
+    saved = (st.STATE_FILE, entry.MATTERMOST_WEBHOOK_URL, entry.send,
+             entry.SHEET_URL, tg.SHEET_URL, tg.read_sheet, entry.run_full)
+    try:
+        st.STATE_FILE = tmp / "state.json"
+        entry.MATTERMOST_WEBHOOK_URL = "http://127.0.0.1:9/test"
+        entry.send = lambda text, url: sent.append(text) or True
+        entry.SHEET_URL = tg.SHEET_URL = SHEET
+
+        def broken(url, opener=None):
+            raise sh.SheetUnavailable("таблица закрыта")
+        tg.read_sheet = broken
+        assert entry.main([]) == 3
+        assert entry.main([]) == 3
+        assert len(sent) == 1 and "Причина: таблица закрыта" in sent[0]
+        assert (tmp / "sheet_alert.json").exists()
+        # Выборку запускает человек: в канал не пишем.
+        assert entry.main(["--limit", "3"]) == 3 and len(sent) == 1
+
+        tg.read_sheet = lambda url, opener=None: sh.parse_columns(
+            _SHEET_BODY.decode("utf-8"))
+        entry.run_full = lambda loaded, no_notify: 0
+        assert entry.main([]) == 0
+        assert len(sent) == 2 and "снова читается" in sent[1]
+        assert not (tmp / "sheet_alert.json").exists()
+        assert entry.main([]) == 0 and len(sent) == 2
+    finally:
+        (st.STATE_FILE, entry.MATTERMOST_WEBHOOK_URL, entry.send,
+         entry.SHEET_URL, tg.SHEET_URL, tg.read_sheet, entry.run_full) = saved
 
 
 # ---------------------------------------------------------------------------

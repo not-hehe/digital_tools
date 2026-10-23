@@ -134,6 +134,7 @@ def check_all(targets: List[dict], max_workers: int = None,
                 result = check_domain(target["url"], target.get("label"),
                                       timeout=timeout, session=session)
             result["contour"] = target.get("contour") or "unknown"
+            result["known_bad"] = bool(target.get("known_bad"))
             return result
         except Exception as e:
             # Сбой ВНЕ check_domain (битая цель, отказ создания сессии).

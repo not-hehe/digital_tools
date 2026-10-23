@@ -109,6 +109,32 @@ def apply_results(state: dict, results: List[dict],
         key = result.get("label") or result.get("url")
         prev = old.get(key) or {"fails": 0, "down": False, "since": None}
         was_down = bool(prev.get("down"))
+        promoted = bool(prev.get("promoted"))
+        if promoted:
+            # Оживший однажды живёт по обычным правилам, даже пока в таблице
+            # его не перенесли из колонки ошибок; журнал читает этот же флаг.
+            result["known_bad"] = False
+
+        if result.get("known_bad"):
+            if result.get("ok"):
+                events.append({"event": EVENT_UP, "label": key,
+                               "url": result.get("url"),
+                               "contour": result.get("contour") or "unknown",
+                               "since": prev.get("since"), "reason": None,
+                               "reported": True, "revived": True})
+                domains[key] = {"fails": 0, "down": False, "since": None,
+                                "promoted": True}
+            else:
+                # Лежит заранее: сразу "упал и сообщено", чтобы ни группа,
+                # ни 16 часов не вынесли его в канал.
+                domains[key] = {"fails": int(prev.get("fails") or 0) + 1,
+                                "down": True,
+                                "since": prev.get("since") or now,
+                                "reported": True, "known_bad": True,
+                                "url": result.get("url"),
+                                "contour": result.get("contour") or "unknown",
+                                "reason": reason_of(result)}
+            continue
 
         if result.get("ok"):
             if was_down:
@@ -118,6 +144,8 @@ def apply_results(state: dict, results: List[dict],
                                "since": prev.get("since"), "reason": None,
                                "reported": bool(prev.get("reported"))})
             domains[key] = {"fails": 0, "down": False, "since": None}
+            if promoted:
+                domains[key]["promoted"] = True
             continue
 
         fails = int(prev.get("fails") or 0) + 1
@@ -139,6 +167,8 @@ def apply_results(state: dict, results: List[dict],
         elif is_down:
             entry.update({k: prev.get(k) for k in
                           ("reported", "url", "contour", "reason")})
+        if promoted:
+            entry["promoted"] = True
         domains[key] = entry
 
     new_state = {"version": STATE_VERSION, "updated_at": now,
@@ -147,9 +177,11 @@ def apply_results(state: dict, results: List[dict],
     # каждый прогон, и heartbeat уходил бы в канал каждые пять минут.
     if state.get("last_heartbeat") if isinstance(state, dict) else None:
         new_state["last_heartbeat"] = state["last_heartbeat"]
-    logger.info("События: упало %d, поднялось %d",
+    logger.info("События: упало %d, поднялось %d, ожило из списка ошибок %d",
                 sum(1 for e in events if e["event"] == EVENT_DOWN),
-                sum(1 for e in events if e["event"] == EVENT_UP))
+                sum(1 for e in events
+                    if e["event"] == EVENT_UP and not e.get("revived")),
+                sum(1 for e in events if e.get("revived")))
     return new_state, events
 
 
@@ -239,3 +271,43 @@ def due_for_heartbeat(state: dict, every_hours: int = None) -> bool:
 def mark_heartbeat(state: dict) -> dict:
     state["last_heartbeat"] = _stamp()
     return state
+
+
+def _sheet_alert_path(path=None):
+    # Отдельный файл, а не поле в state.json: при сбое таблицы прогон
+    # до состояния не доходит, а отметка нужна именно тогда.
+    return STATE_FILE.parent / "sheet_alert.json" if path is None else path
+
+
+def load_sheet_alert(path=None) -> Optional[dict]:
+    """Отметка "о сбое таблицы уже сообщено" или None."""
+    try:
+        with open(_sheet_alert_path(path), encoding="utf-8") as f:
+            mark = json.load(f)
+        return mark if isinstance(mark, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sheet_alert(reason: str, path=None) -> bool:
+    path = _sheet_alert_path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"since": _stamp(), "reason": reason}, f,
+                      ensure_ascii=False)
+        return True
+    except OSError as e:
+        logger.error("Отметка о сбое таблицы не сохранена (%s): %s", path, e)
+        return False
+
+
+def clear_sheet_alert(path=None) -> None:
+    try:
+        _sheet_alert_path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.error("Отметка о сбое таблицы не удалена: %s", e)

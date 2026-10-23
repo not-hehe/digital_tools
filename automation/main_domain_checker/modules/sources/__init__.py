@@ -5,10 +5,12 @@
 по контурам. Что внутри Excel и как он устроен, за пределы слоя не выходит.
 """
 
+from .sheet import SheetUnavailable, contour_column
 from .targets import (CONTOUR_EXTERNAL, CONTOUR_INTERNAL, CONTOUR_UNKNOWN,
                       EmptyTargetList, count_by_contour, load_from_excel,
-                      load_targets, normalize_contour)
+                      load_from_sheet, load_targets, normalize_contour)
 
-__all__ = ["load_targets", "load_from_excel", "EmptyTargetList",
+__all__ = ["load_targets", "load_from_excel", "load_from_sheet",
+           "EmptyTargetList", "SheetUnavailable", "contour_column",
            "count_by_contour", "normalize_contour",
            "CONTOUR_INTERNAL", "CONTOUR_EXTERNAL", "CONTOUR_UNKNOWN"]

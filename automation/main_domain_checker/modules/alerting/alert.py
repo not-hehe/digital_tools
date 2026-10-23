@@ -14,11 +14,15 @@
 import logging
 from collections import Counter, OrderedDict
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
-from ..probe import reason_of
+from ..probe import failure_label, reason_of
+from ..probe.failures import (FAIL_DNS, FAIL_TLS, FAIL_TIMEOUT, FAIL_REFUSED,
+                              FAIL_REDIRECT_LOOP, FAIL_PROXY, FAIL_INVALID_URL,
+                              FAIL_OTHER)
 from ..config import (GROUP_WINDOW_MINUTES, GUARD_MIN_ITEMS, LONE_DOWN_HOURS,
-                     MASS_FAILURE_RATIO, MATTERMOST_TIMEOUT, now_msk)
+                     MASS_FAILURE_RATIO, MATTERMOST_TIMEOUT, REQUEST_TIMEOUT,
+                     now_msk)
 from .notifier import send_to_mattermost
 
 logger = logging.getLogger(__name__)
@@ -28,10 +32,59 @@ _CONTOUR_NAMES = {"internal": "внутренним контуром",
 
 _NO_LIST = "Список не приводится: он не помогает."
 
+_HTTP_PLAIN = {
+    400: "сервер не понял запрос",
+    401: "нужен вход по логину и паролю",
+    403: "доступ запрещён",
+    404: "страница не найдена",
+    429: "сервер ограничил число запросов",
+    500: "внутренняя ошибка сервера",
+    502: "промежуточный сервер получил от сайта неверный ответ",
+    503: "сервер временно недоступен (перегружен или на обслуживании)",
+    504: "промежуточный сервер не дождался ответа от сайта",
+}
+
+_KIND_PLAIN = {
+    FAIL_TIMEOUT: ("Тайм-аут", "не открылся: сервер не ответил за {} "
+                   "секунд".format(REQUEST_TIMEOUT)),
+    FAIL_DNS: ("DNS", "не открылся: адрес не найден - домена нет в DNS "
+               "или он виден только из внутренней сети"),
+    FAIL_TLS: ("TLS", "не открылся: защищённое соединение не установилось - "
+               "не подошли сертификат или шифрование"),
+    FAIL_REFUSED: ("Отказ соединения",
+                   "не открылся: сервер отклонил или оборвал соединение"),
+    FAIL_REDIRECT_LOOP: ("Редиректы по кругу",
+                         "не открылся: сайт бесконечно перенаправляет "
+                         "на другие адреса"),
+    FAIL_PROXY: ("Прокси", "не открылся: прокси на машине проверки "
+                 "не пропустил запрос"),
+    FAIL_INVALID_URL: ("Не адрес", "не проверялся: в списке строка, "
+                       "которая не является адресом сайта"),
+    FAIL_OTHER: ("Прочая ошибка", "не открылся по другой причине"),
+}
+
+# В state.json и runs.log причина хранится строкой из reason_of, поэтому
+# пояснение ищется по ней, а не по виду отказа.
+_PLAIN_BY_LABEL = {failure_label(k): v for k, v in _KIND_PLAIN.items()}
+
 
 # ---------------------------------------------------------------------------
 # Сборка текста
 # ---------------------------------------------------------------------------
+
+def _explain(reason: str) -> Tuple[str, Optional[str]]:
+    """Короткое имя причины и пояснение простыми словами для канала."""
+    if reason.startswith("HTTP "):
+        try:
+            code = int(reason[5:])
+        except ValueError:
+            return reason, None
+        plain = _HTTP_PLAIN.get(code) or (
+            "сбой на стороне сервера" if code >= 500
+            else "сервер отказал в запросе")
+        return reason, "открылся с ошибкой: " + plain
+    return _PLAIN_BY_LABEL.get(reason, (reason, None))
+
 
 def _group(items: List[dict], key: Callable) -> "OrderedDict[str, List[dict]]":
     """Раскладывает по группам, крупные сверху: чинить начинают с массового."""
@@ -43,10 +96,13 @@ def _group(items: List[dict], key: Callable) -> "OrderedDict[str, List[dict]]":
 
 
 def _render_groups(groups: "OrderedDict[str, List[dict]]") -> List[str]:
-    """Строки вида "причина - N" и адреса под ней с отступом."""
+    """Строки вида "причина - N", пояснение и адреса под ней с отступом."""
     lines = []
     for reason, items in groups.items():
-        lines.append("{} - {}".format(reason, len(items)))
+        title, plain = _explain(reason)
+        lines.append("{} - {}".format(title, len(items)))
+        if plain:
+            lines.append("  {}".format(plain))
         for item in items:
             lines.append("  {}".format(item["label"]))
         lines.append("")
@@ -80,25 +136,53 @@ def build_alert(results: List[dict], checked_at: datetime = None,
     None это сигнал вызывающему, что отправлять нечего: тихий канал при
     здоровых доменах и есть требование этой версии.
     """
-    bad = problems(results)
-    if not bad:
+    main = [r for r in results if not r.get("known_bad")]
+    bad = problems(main)
+    revived = [r for r in results if r.get("known_bad") and r.get("ok")]
+    if not bad and not revived:
         return None
     checked_at = checked_at or now_msk()
 
-    # Предохранители нужны и здесь. Ручной прогон по всему списку с машины,
-    # у которой отвалилась сеть, давал сообщение на 263 строки с перечнем
-    # 236 адресов - тот самый случай, ради которого их и заводили.
-    guard = _guards(bad, [], len(results), checked_at, contour_counts,
-                    down_lead="Не отвечают")
-    if guard is not None:
-        return guard
-
-    lines = ["🔴 Домены: проблемных {} из {}".format(len(bad), len(results)),
-             ""]
-    lines += _render_groups(group_by_reason(bad))
+    lines = []
+    if bad:
+        # Предохранители нужны и здесь. Ручной прогон по всему списку
+        # с машины, у которой отвалилась сеть, давал сообщение на 263 строки
+        # с перечнем 236 адресов - тот самый случай, ради которого их заводили.
+        guard = _guards(bad, [], len(main), checked_at, contour_counts,
+                        down_lead="Не отвечают")
+        if guard is not None:
+            return guard + _revived_block(revived)
+        lines += ["🔴 Домены: проблемных {} из {}".format(len(bad), len(main)),
+                  ""]
+        lines += _render_groups(group_by_reason(bad))
+    if revived:
+        lines += _revived_lines(revived)
     lines.append(_footer(len(results), checked_at,
                          " · проблемных {}".format(len(bad))))
     return "\n".join(lines) + "\n"
+
+
+_COLUMN_OF_CONTOUR = {"external": "внешний", "internal": "внутренний"}
+
+
+def _revived_lines(items: List[dict]) -> List[str]:
+    """Сайты из колонки ошибок, которые снова отвечают.
+
+    В предохранители не входят: список того, что пора перенести в таблице,
+    нельзя заменять строкой "дело в машине проверки".
+    """
+    lines = ["🟢 Ожили из списка ошибок: {}".format(len(items))]
+    lines += ["  {}".format(item["label"]) for item in items]
+    column = _COLUMN_OF_CONTOUR.get(items[0].get("contour"))
+    lines.append('Перенесите их в таблице из колонки "ошибки" в "{}".'.format(
+        column) if column else
+        'Перенесите их в таблице из колонки "ошибки" в колонку контура.')
+    lines.append("")
+    return lines
+
+
+def _revived_block(items: List[dict]) -> str:
+    return "\n" + "\n".join(_revived_lines(items)) if items else ""
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +288,14 @@ def build_event_alert(events: List[dict], checked: int,
     if not events:
         return None
     checked_at = checked_at or now_msk()
+    revived = [e for e in events if e.get("revived")]
     fell = [e for e in events if e.get("event") == "down"]
-    rose = [e for e in events if e.get("event") == "up"]
+    rose = [e for e in events
+            if e.get("event") == "up" and not e.get("revived")]
 
     guard = _guards(fell, rose, checked, checked_at, contour_counts)
     if guard is not None:
-        return guard
+        return guard + _revived_block(revived)
 
     lines = []
     # Долгие одиночные падения и массовые отдельно: у них разный смысл.
@@ -232,9 +318,12 @@ def build_event_alert(events: List[dict], checked: int,
         lines.append("")
         for e in lone:
             since = (e.get("since") or "").replace("T", " ")[:16]
+            title, plain = _explain(e.get("reason") or "причина не определена")
             lines.append("  {} - {}{}".format(
-                e["label"], e.get("reason") or "причина не определена",
+                e["label"], title,
                 " (с {})".format(since) if since else ""))
+            if plain:
+                lines.append("    {}".format(plain))
         lines.append("")
     if rose:
         lines.append("🟢 Поднялись: {}".format(len(rose)))
@@ -244,6 +333,8 @@ def build_event_alert(events: List[dict], checked: int,
                 e["label"],
                 " (не отвечал с {})".format(since) if since else ""))
         lines.append("")
+    if revived:
+        lines += _revived_lines(revived)
     lines.append(_footer(checked, checked_at))
     return "\n".join(lines) + "\n"
 
@@ -260,6 +351,24 @@ def build_heartbeat(checked: int, problems_count: int,
     body = "Проверено {} доменов, не отвечают {}.".format(checked, problems_count)
     return "🟢 Чекер жив\n\n{}\n\n{}\n".format(
         body, _footer(checked, checked_at))
+
+
+def build_sheet_down(reason: str, checked_at: datetime = None) -> str:
+    checked_at = checked_at or now_msk()
+    return ("⚠️ Не удалось прочитать Google-таблицу со списком доменов\n\n"
+            "Причина: {}\n\n"
+            "Домены не проверяются, пока таблица не прочитается. Повторять это\n"
+            "сообщение не буду, напишу, когда таблица снова прочитается.\n\n"
+            "{} МСК\n".format(reason, checked_at.strftime("%Y-%m-%d %H:%M")))
+
+
+def build_sheet_up(since: str = None, checked_at: datetime = None) -> str:
+    checked_at = checked_at or now_msk()
+    since = (since or "").replace("T", " ")[:16]
+    return ("🟢 Google-таблица снова читается, проверка доменов продолжается.\n"
+            "{}\n{} МСК\n".format(
+                "Не читалась с {}.".format(since) if since else "",
+                checked_at.strftime("%Y-%m-%d %H:%M")))
 
 
 # ---------------------------------------------------------------------------

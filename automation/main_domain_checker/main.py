@@ -3,8 +3,9 @@
 
 Запускается по расписанию через `run.sh` - никакого планировщика внутри нет.
 Код возврата: 0 - прогон состоялся, 1 - прогон не состоялся или его результат
-не сохранён. Ненулевой код это единственный внешний признак того, что чекер
-работает вхолостую, поэтому наружу он выставляется честно.
+не сохранён, 3 - не прочиталась Google-таблица (об этом сообщено отдельно).
+Ненулевой код это единственный внешний признак того, что чекер работает
+вхолостую, поэтому наружу он выставляется честно.
 
 Полный прогон помнит состояние между запусками и шлёт сообщение только
 на смену статуса. Выборка (`--limit N`) состояние не трогает вовсе и печатает
@@ -18,13 +19,19 @@ import sys
 
 from modules.alerting import (EVENT_DOWN, EVENT_UP, apply_results,
                               build_alert, build_event_alert, build_heartbeat,
-                              due_for_heartbeat, event_lines, load_state,
+                              build_sheet_down, build_sheet_up,
+                              clear_sheet_alert, due_for_heartbeat,
+                              event_lines, load_sheet_alert, load_state,
                               mark_heartbeat, pick_alerts, run_line,
-                              runlog_append, save_state, send)
-from modules.config import (INPUT_FILE, LOG_FORMAT, LOG_LEVEL,
-                            MATTERMOST_WEBHOOK_URL, STATE_FILE)
+                              runlog_append, save_sheet_alert, save_state,
+                              send)
+from modules.config import (CONTOUR, INPUT_FILE, LOG_FORMAT, LOG_LEVEL,
+                            MATTERMOST_WEBHOOK_URL, SHEET_URL, STATE_FILE)
 from modules.probe import check_all
-from modules.sources import EmptyTargetList, load_targets
+from modules.sources import (EmptyTargetList, SheetUnavailable,
+                             contour_column, load_targets)
+
+EXIT_SHEET_UNAVAILABLE = 3
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +92,24 @@ def _report_sending(text, no_notify: bool) -> bool:
         return True
     print("Отправить в Mattermost не удалось, подробности в логе выше.")
     return False
+
+
+def report_sheet_down(reason: str, no_notify: bool) -> None:
+    """Один раз на сбой: отметка ставится только после удачной отправки,
+    иначе неотправленное сообщение не повторилось бы никогда."""
+    if load_sheet_alert() is not None:
+        print("О сбое таблицы уже сообщено, повторно не пишу.")
+        return
+    if _report_sending(build_sheet_down(reason), no_notify):
+        save_sheet_alert(reason)
+
+
+def report_sheet_up(no_notify: bool) -> None:
+    mark = load_sheet_alert()
+    if mark is None:
+        return
+    if _report_sending(build_sheet_up(mark.get("since")), no_notify):
+        clear_sheet_alert()
 
 
 def run_sample(loaded: dict, no_notify: bool) -> int:
@@ -158,8 +183,21 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     setup_logging()
 
+    if SHEET_URL and args.input is None:
+        try:
+            contour_column(CONTOUR)
+        except ValueError as e:
+            logger.error("%s (DC_CONTOUR в .env)", e)
+            return 1
+
     try:
         loaded = load_targets(limit=args.limit, path=args.input)
+    except SheetUnavailable as e:
+        logger.error("Google-таблица не прочитана: %s", e)
+        # Выборку запускает человек в терминале, ему хватит строки выше.
+        if not args.limit:
+            report_sheet_down(str(e), args.no_notify)
+        return EXIT_SHEET_UNAVAILABLE
     except (EmptyTargetList, FileNotFoundError) as e:
         # Трассировка стека здесь ничего не добавляет к тому, что файла нет
         # или он пуст, а код возврата и так скажет вызывающему всё нужное.
@@ -167,13 +205,16 @@ def main(argv=None):
         return 1
 
     counts = loaded["counts"]
-    print("Целей: {} (внутренних {}, внешних {}, без метки {}), "
-          "отсеяно мусорных строк: {}".format(
+    print("Целей: {} (внутренних {}, внешних {}, без метки {}, из списка "
+          "ошибок {}), отсеяно мусорных строк: {}".format(
               len(loaded["targets"]), counts["internal"], counts["external"],
-              counts["unknown"], len(loaded["skipped"])))
+              counts["unknown"], loaded.get("known_bad", 0),
+              len(loaded["skipped"])))
 
     if args.limit:
         return run_sample(loaded, args.no_notify)
+    if loaded.get("source") == "sheet":
+        report_sheet_up(args.no_notify)
     return run_full(loaded, args.no_notify)
 
 

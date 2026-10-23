@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 KIND_RUN = "прогон"
 KIND_DOWN = "упал"
 KIND_UP = "поднялся"
+KIND_REVIVED = "ожил"
 
 
 def _stamp() -> str:
@@ -45,11 +46,16 @@ def run_line(results: List[dict]) -> str:
     отказ, не дошедший до порога подтверждения, виден только здесь.
     """
     failing = [r for r in results if not r.get("ok")]
+    # Колонка ошибок лежит каждый прогон: её имена раздули бы каждую строку
+    # на сотню адресов, а журнал обрезается по числу строк, не по размеру.
+    named = [r for r in failing if not r.get("known_bad")]
     body = "проверено {}, не ответили {}".format(len(results), len(failing))
-    if failing:
+    if len(named) < len(failing):
+        body += " (из списка ошибок {})".format(len(failing) - len(named))
+    if named:
         body += ": " + ", ".join(
             "{} ({})".format(r.get("label") or r.get("url"), _reason_of(r))
-            for r in failing)
+            for r in named)
     return _line(KIND_RUN, body)
 
 
@@ -59,6 +65,9 @@ def event_lines(events: List[dict]) -> List[str]:
         if e.get("event") == "down":
             lines.append(_line(KIND_DOWN, "{} - {}".format(
                 e.get("label"), e.get("reason") or "причина не определена")))
+        elif e.get("revived"):
+            lines.append(_line(KIND_REVIVED, "{} (из списка ошибок)".format(
+                e.get("label"))))
         else:
             since = (e.get("since") or "").replace("T", " ")[:16]
             lines.append(_line(KIND_UP, "{} - не отвечал с {}".format(
