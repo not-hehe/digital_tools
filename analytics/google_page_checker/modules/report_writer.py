@@ -3,7 +3,7 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Dict, List, TextIO
 
-from .aggregator import has_network_evidence, has_strong_markers
+from .aggregator import has_network_evidence
 from .failures import (FAILURE_ORDER, FAIL_OTHER, failure_label, failure_hint)
 from .classifier import is_universal_analytics
 from .config import (STATUS_WORKING, STATUS_BROKEN, STATUS_SUSPICIOUS,
@@ -245,6 +245,11 @@ class ReportWriter:
     # ------------------------------------------------------------------
 
     def build_summary(self, all_results: List[Dict]) -> str:
+        # Сайты из списка ошибок в счётчики не входят: это перепроверка,
+        # а не основной список; в сообщении они видны только если ожили.
+        revived = [r for r in all_results
+                   if r.get("from_errors") and has_network_evidence(r)]
+        all_results = [r for r in all_results if not r.get("from_errors")]
         groups = self._group_results(all_results)
         n_err = len(groups[STATUS_ERROR])
         opened = [r for r in all_results if _status_of(r) != STATUS_ERROR]
@@ -255,13 +260,6 @@ class ReportWriter:
                 ga_found.append(r)
             else:
                 ga_not_found.append(r)
-        # Сайты без сетевой активности, но с ID установки в вёрстке.
-        # Отдельная строка нужна, чтобы «обнаружено: 7» в этом отчёте и
-        # «GA есть: 127» в расширенном не выглядели противоречием: это
-        # разные вопросы — «счётчик работает» и «тег лежит в коде».
-        markup_only = [r for r in ga_not_found if has_strong_markers(r)]
-        ua_only = [r for r in markup_only
-                   if is_universal_analytics(r.get("container_id"))]
 
         lines = []
         lines.append("=== ОТЧЁТ ПО НАЛИЧИЮ GOOGLE ANALYTICS ===")
@@ -269,12 +267,6 @@ class ReportWriter:
         lines.append(f"Успешно открыто (всего)     : {len(opened)}")
         lines.append(f"  └─ Google обнаружено      : {len(ga_found)}")
         lines.append(f"  └─ Google не обнаружено   : {len(ga_not_found)}")
-        # if markup_only:
-        #     lines.append(f"     из них тег GA лежит в вёрстке, "
-        #                  f"но не срабатывает : {len(markup_only)}")
-        if ua_only:
-            lines.append(f"     из них мёртвый тег Universal Analytics "
-                         f"(отключён Google) : {len(ua_only)}")
         lines.append(f"Ошибок (не удалось открыть) : {n_err}")
         lines.append("-" * 60)
 
@@ -282,16 +274,14 @@ class ReportWriter:
             lines.append("--- Google обнаружен ---")
             for r in ga_found:
                 lines.append(r["url"])
-                lines.append("  Статус : Google Found")
+            lines.append("-" * 60)
 
-        if groups[STATUS_ERROR]:
-            lines.append("--- Ошибка при открытии ---")
-            for kind, items in group_failures(groups[STATUS_ERROR]).items():
-                lines.append(f"  {failure_label(kind)} — {len(items)}")
-                for r in items:
-                    lines.append(f"    {r['url']}")
+        if revived:
+            lines.append("--- Ожили из списка ошибок, Google есть ---")
+            for r in revived:
+                lines.append(r["url"])
+            lines.append("-" * 60)
 
-        lines.append("-" * 60)
         lines.append("КОНЕЦ ОТЧЁТА")
         return "\n".join(lines) + "\n"
 

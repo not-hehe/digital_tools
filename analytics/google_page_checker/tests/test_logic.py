@@ -763,7 +763,7 @@ def test_ua_in_reports():
     # живой GTM в свою секцию не съехал
     assert "--- BROKEN — GA в вёрстке есть, рабочих хитов нет (1) ---" in text
 
-    assert "мёртвый тег Universal Analytics (отключён Google) : 3" in summary
+    assert "Universal Analytics" not in summary
 
 
 def test_mattermost_webhook_source():
@@ -893,7 +893,7 @@ def test_probe():
 
 
 def test_summary_report():
-    """Краткий отчёт «для чата»: обнаружено/не обнаружено/ошибки по видам."""
+    """Краткий отчёт «для чата»: счётчики и список сайтов, где Google обнаружен."""
     results = [
         _run_worker(FakePage([COLLECT], GTM_HTML)),           # хиты -> found
         _run_worker(FakePage([GTM404, ERRTEL], GTM_HTML)),    # gtm.js -> found
@@ -918,23 +918,21 @@ def test_summary_report():
                      "  └─ Google не обнаружено   : 4",
                      "Ошибок (не удалось открыть) : 1",
                      "--- Google обнаружен ---",
-                     "Статус : Google Found",
-                     "--- Ошибка при открытии ---",
-                     # ошибки сгруппированы по причине, а не свалены списком
-                     "домен не резолвится",
                      "КОНЕЦ ОТЧЁТА"):
         assert fragment in text, f"в кратком отчёте нет: {fragment}"
 
-    # расхождение с расширенным отчётом объясняется прямо в шапке:
-    # сайт с зондовой уликой — это «тег есть, но не срабатывает»
-    assert "тег GA лежит в вёрстке, но не срабатывает : 1" in text
+    # в канал уходят только счётчики и найденные сайты
+    for fragment in ("Статус : Google Found", "Ошибка при открытии",
+                     "домен не резолвится", "в вёрстке"):
+        assert fragment not in text, f"в кратком отчёте лишнее: {fragment}"
 
     # статусы и причины в кратком отчёте не подсвечиваются
     assert "BROKEN" not in text and "WORKING" not in text
     assert "SUSPICIOUS" not in text and "контекст:" not in text
     assert "зонд" not in text
     assert "--- Google не обнаружен" not in text
-    assert text.count("Google Found") == 2
+    found = text.split("--- Google обнаружен ---\n")[1].split("-" * 60)[0]
+    assert len(found.splitlines()) == 2
     # компактная структура: без пустых строк между записями
     assert "\n\n" not in text
 
@@ -1231,6 +1229,181 @@ def test_browser_launch_args():
     assert "--host-resolver-rules=X" in args
 
 
+def _fake_response(body=b"", ctype="text/csv"):
+    class Resp:
+        headers = types.SimpleNamespace(get_content_type=lambda: ctype)
+
+        def read(self):
+            return body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+    return Resp()
+
+
+def _sheet_error(opener):
+    from modules.sheet_reader import read_sheet, SheetUnavailable
+    try:
+        read_sheet("https://docs.google.com/spreadsheets/d/abc123/edit", opener=opener)
+    except SheetUnavailable as e:
+        return str(e)
+    raise AssertionError("SheetUnavailable не выброшено")
+
+
+def test_sheet_reader():
+    """Чтение таблицы: три колонки и понятные причины каждого отказа."""
+    import socket
+    import urllib.error
+    from modules.sheet_reader import read_sheet, parse_columns, SheetUnavailable
+
+    csv_text = "Ошибки,Внутренний контур,Внешний контур\ne.ru,i.ru,x.ru\n,i2.ru,\n"
+    seen = {}
+
+    def ok(request, timeout):
+        seen["url"] = request.full_url
+        return _fake_response(csv_text.encode("utf-8"))
+
+    cols = read_sheet("https://docs.google.com/spreadsheets/d/abc123/edit#gid=5", opener=ok)
+    assert cols == {"errors": ["e.ru"], "internal": ["i.ru", "i2.ru"],
+                    "external": ["x.ru"]}, cols
+    assert "abc123" in seen["url"] and "gid=5" in seen["url"]
+
+    assert "закрыта" in _sheet_error(lambda r, timeout: _fake_response(b"<html>", "text/html"))
+
+    def http404(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "nf", {}, None)
+    assert "не найдена" in _sheet_error(http404)
+
+    assert "пуста" in _sheet_error(lambda r, timeout: _fake_response(b""))
+
+    try:
+        parse_columns("Ошибки,Внутренний\na,b\n")
+        raise AssertionError("нет колонки не замечено")
+    except SheetUnavailable as e:
+        assert "внешний" in str(e)
+
+    def slow(request, timeout):
+        raise socket.timeout()
+    assert "не ответил" in _sheet_error(slow)
+
+
+def test_contour_column():
+    from modules.sheet_reader import contour_column
+    assert contour_column(1) == "external"
+    assert contour_column(2) == "internal"
+    assert contour_column("1") == "external"
+    for bad in ("3", 0, "x", None):
+        try:
+            contour_column(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r} должен быть отвергнут")
+
+
+def test_build_targets():
+    import main as m
+    columns = {"external": ["a.ru", "https://B.ru/", "нет", "—"],
+               "internal": ["in.ru"],
+               "errors": ["b.ru", "old.ru", "мусор", "https://old.ru"]}
+    urls, errors, skipped = m.build_targets(columns, 1)
+    assert urls == ["https://a.ru", "https://B.ru/", "https://old.ru"], urls
+    assert errors == {"https://old.ru"}, "дубль контура попал в ошибки"
+    assert skipped == 3, skipped
+    urls2, errors2, _ = m.build_targets(columns, 2)
+    assert urls2[0] == "https://in.ru" and "https://b.ru" in urls2
+    assert errors2 == {"https://b.ru", "https://old.ru"}
+    try:
+        m.build_targets(columns, 3)
+        raise AssertionError("контур 3 принят")
+    except ValueError:
+        pass
+    # Excel-путь: тот же отсев без таблицы
+    cleaned, skipped = m.clean_urls(["a.ru", "A.RU/", "нет", ""])
+    assert cleaned == ["https://a.ru"] and skipped == 2, (cleaned, skipped)
+
+
+def test_summary_from_errors():
+    """Сайты из «ошибок» не входят в счётчики; ожившие с Google — отдельный блок."""
+    base = [_run_worker(FakePage([COLLECT], GTM_HTML), "https://main.example.com"),
+            _run_worker(FakePage([], CLEAN_HTML), "https://clean.example.com")]
+    writer = ReportWriter(Path("unused.txt"))
+
+    def summary(err_page, url="https://old.example.com"):
+        r = _run_worker(err_page, url)
+        r["from_errors"] = True
+        return writer.build_summary(base + [r])
+
+    still_dead = summary(FakePage([], CLEAN_HTML, fail=True))
+    assert "Ожили" not in still_dead
+    assert "Всего URL в списке          : 2" in still_dead
+    assert "old.example.com" not in still_dead
+    assert "Ошибок (не удалось открыть) : 0" in still_dead
+
+    revived = summary(FakePage([COLLECT], GTM_HTML))
+    assert "Всего URL в списке          : 2" in revived
+    assert "  └─ Google обнаружено      : 1" in revived
+    block = revived.split("--- Ожили из списка ошибок, Google есть ---\n")[1]
+    assert block.split("-" * 60)[0] == "https://old.example.com\n"
+    found = revived.split("--- Google обнаружен ---\n")[1].split("-" * 60)[0]
+    assert "old.example.com" not in found
+    assert revived.index("--- Google обнаружен ---") < revived.index("Ожили")
+    assert revived.endswith("-" * 60 + "\nКОНЕЦ ОТЧЁТА\n")
+
+    no_google = summary(FakePage([], CLEAN_HTML))
+    assert "Ожили" not in no_google and "old.example.com" not in no_google
+
+    only_revived = writer.build_summary([_run_worker(
+        FakePage([COLLECT], GTM_HTML), "https://old.example.com") | {"from_errors": True}])
+    assert "--- Google обнаружен ---" not in only_revived
+    assert "Ожили" in only_revived
+
+
+def test_main_sheet_unavailable():
+    """Недоступная таблица: алерт в канал, код 1, браузер не запускается."""
+    import main as m
+
+    sent, saved = [], {}
+    names = ("SHEET_URL", "CONTOUR", "MATTERMOST_WEBHOOK_URL", "BrowserManager",
+             "send_to_mattermost", "setup_logging", "read_sheet")
+    for n in names:
+        saved[n] = getattr(m, n)
+
+    def boom(*a, **k):
+        raise AssertionError("браузер запущен")
+
+    def closed(url):
+        from modules.sheet_reader import SheetUnavailable
+        raise SheetUnavailable("таблица закрыта")
+    try:
+        m.SHEET_URL, m.CONTOUR = "https://docs.google.com/spreadsheets/d/x/edit", 1
+        m.MATTERMOST_WEBHOOK_URL = "http://127.0.0.1:9/hooks/t"
+        m.BrowserManager = boom
+        m.setup_logging = lambda: None
+        m.send_to_mattermost = lambda url, text, timeout=10: sent.append(text)
+        m.read_sheet = closed
+        assert asyncio.run(m.main()) == 1
+        assert sent == ["```\n⚠️ GA-чекер: не удалось прочитать Google-таблицу "
+                        "со списком\n\nПричина: таблица закрыта\n```"], sent
+
+        sent.clear()
+        m.CONTOUR = 7
+        m.read_sheet = lambda url: {}
+        assert asyncio.run(m.main()) == 1 and not sent, "неверный контур: код 1 без отправки"
+
+        m.CONTOUR = 1
+        m.read_sheet = lambda url: {"errors": ["dead.example.com"],
+                                    "internal": ["in.example.com"],
+                                    "external": ["нет"]}
+        assert asyncio.run(m.main()) == 1
+        assert sent and 'в колонке "внешний" нет ни одного адреса' in sent[-1], sent
+    finally:
+        for n, v in saved.items():
+            setattr(m, n, v)
+
+
 def main():
     tests = [
         test_config_patterns,
@@ -1261,6 +1434,11 @@ def main():
         test_browser_manager_semaphore,
         test_browser_launch_args,
         test_main_error_fallback,
+        test_sheet_reader,
+        test_contour_column,
+        test_build_targets,
+        test_summary_from_errors,
+        test_main_sheet_unavailable,
     ]
     failed = 0
     for test in tests:

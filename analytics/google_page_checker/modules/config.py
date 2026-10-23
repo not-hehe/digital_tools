@@ -190,14 +190,14 @@ SECRETS_DIR = BASE_DIR / "secrets"
 MATTERMOST_WEBHOOK_FILE = SECRETS_DIR / "mattermost_webhook.txt"
 
 
-def _read_webhook() -> str:
-    from_env = os.environ.get("GPC_MATTERMOST_WEBHOOK", "").strip()
+def _read_secret(env_name: str, path: Path) -> str:
+    from_env = os.environ.get(env_name, "").strip()
     if from_env:
         return from_env
     try:
         # Первая непустая строка, не начинающаяся с #: файл можно
         # комментировать, не ломая чтение.
-        for line in MATTERMOST_WEBHOOK_FILE.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
                 return line
@@ -206,8 +206,15 @@ def _read_webhook() -> str:
     return ""
 
 
-MATTERMOST_WEBHOOK_URL = _read_webhook()
+MATTERMOST_WEBHOOK_URL = _read_secret("GPC_MATTERMOST_WEBHOOK",
+                                      MATTERMOST_WEBHOOK_FILE)
 MATTERMOST_TIMEOUT = 10  # секунд на отправку
+
+# Источник списка: Google-таблица (ссылка — тоже секрет, в репозиторий не
+# кладём). Пусто — читается Excel, как раньше.
+CONTOUR = 1  # 1 внешний, 2 внутренний
+SHEET_URL_FILE = SECRETS_DIR / "sheet_url.txt"
+SHEET_URL = _read_secret("GPC_SHEET_URL", SHEET_URL_FILE)
 
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

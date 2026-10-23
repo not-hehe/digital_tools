@@ -11,13 +11,17 @@ from modules.report_writer import ReportWriter
 from modules.notifier import send_to_mattermost
 from modules.aggregator import merge_runs, has_network_evidence, run_improved
 from modules.failures import failure_label
-from modules.url_variants import normalize
+from modules.url_variants import normalize, looks_like_url
+from modules.excel_reader import _dedup_key
+from modules.sheet_reader import (COLUMN_NAMES, SheetUnavailable, read_sheet,
+                                  contour_column)
 from modules.config import (INPUT_FILE, OUTPUT_FILE, SUMMARY_FILE,
                             LOG_FILE, LOG_LEVEL, LOG_FORMAT,
                             EXCEL_COLUMN_NAME, EXCEL_SHEET_NAME,
                             EXCEL_EMPTY_ROW_BREAK, MAX_CONCURRENT_PAGES,
                             BROWSER_HEADLESS, BROWSER_SLOW_MO, BLOCK_RESOURCES,
                             ALLOW_LEGACY_TLS,
+                            SHEET_URL, CONTOUR,
                             MATTERMOST_WEBHOOK_URL, MATTERMOST_TIMEOUT, RUN_COUNT,
                             STATUS_WORKING, STATUS_BROKEN, STATUS_SUSPICIOUS,
                             STATUS_NONE, STATUS_ERROR, GA_POSITIVE_STATUSES)
@@ -33,6 +37,43 @@ def setup_logging():
     )
     for lib in ("playwright", "asyncio"):
         logging.getLogger(lib).setLevel(logging.WARNING)
+
+
+def _site_key(url):
+    # Хвостовой «/» в таблице ставят по-разному: это тот же сайт.
+    return _dedup_key(url).rstrip("/")
+
+
+def clean_urls(raw_urls, seen=None):
+    """Отсеивает мусор, нормализует и убирает дубли, порядок сохраняется.
+
+    Возвращает (адреса, число отсеянного мусора); seen — общий набор ключей,
+    чтобы вторая колонка не повторяла сайты первой.
+    """
+    seen = set() if seen is None else seen
+    urls, skipped = [], 0
+    for raw in raw_urls:
+        if not looks_like_url(raw):
+            skipped += 1
+            continue
+        url = normalize(raw.strip())
+        key = _site_key(url)
+        if key not in seen:
+            seen.add(key)
+            urls.append(url)
+    return urls, skipped
+
+
+def build_targets(columns, contour):
+    """Цели из колонок таблицы: контур плюс «ошибки».
+
+    Сайт и в контуре, и в «ошибках» считается контурным. Возвращает
+    (адреса, множество адресов из «ошибок», число отсеянного мусора).
+    """
+    seen = set()
+    urls, skipped = clean_urls(columns[contour_column(contour)], seen)
+    error_urls, skipped_errors = clean_urls(columns["errors"], seen)
+    return urls + error_urls, set(error_urls), skipped + skipped_errors
 
 
 async def process_urls(urls, bm):
@@ -88,16 +129,43 @@ async def main():
     logger.info("Запуск проверки Google")
     logger.info("=" * 60)
 
-    try:
-        urls = list(read_urls_from_excel(INPUT_FILE, column_name=EXCEL_COLUMN_NAME,
-                                         sheet_name=EXCEL_SHEET_NAME,
-                                         empty_row_break=EXCEL_EMPTY_ROW_BREAK))
-        logger.info("Загружено URL: %d", len(urls))
-        if not urls:
-            logger.error("Список URL пуст.")
+    error_urls = set()
+    if SHEET_URL:
+        try:
+            column = contour_column(CONTOUR)
+            columns = read_sheet(SHEET_URL)
+            urls, error_urls, skipped = build_targets(columns, CONTOUR)
+            if len(urls) == len(error_urls):
+                raise SheetUnavailable('в колонке "{}" нет ни одного '
+                                       'адреса'.format(COLUMN_NAMES[column]))
+        except ValueError as e:
+            logger.error("%s", e)
+            return 1
+        except SheetUnavailable as e:
+            logger.error("Не удалось прочитать Google-таблицу: %s", e)
+            if MATTERMOST_WEBHOOK_URL:
+                send_to_mattermost(
+                    MATTERMOST_WEBHOOK_URL,
+                    "```\n⚠️ GA-чекер: не удалось прочитать Google-таблицу "
+                    "со списком\n\nПричина: " + str(e) + "\n```",
+                    timeout=MATTERMOST_TIMEOUT)
+            return 1
+        logger.info("Из таблицы: контур %s, адресов %d (из «ошибок» %d)",
+                    CONTOUR, len(urls), len(error_urls))
+    else:
+        try:
+            raw = list(read_urls_from_excel(
+                INPUT_FILE, column_name=EXCEL_COLUMN_NAME,
+                sheet_name=EXCEL_SHEET_NAME,
+                empty_row_break=EXCEL_EMPTY_ROW_BREAK))
+        except Exception as e:
+            logger.error("Ошибка чтения Excel: %s", e)
             return
-    except Exception as e:
-        logger.error("Ошибка чтения Excel: %s", e)
+        urls, skipped = clean_urls(raw)
+    logger.info("Отсеяно мусорных строк: %d", skipped)
+    logger.info("Загружено URL: %d", len(urls))
+    if not urls:
+        logger.error("Список URL пуст.")
         return
 
     bm = BrowserManager(headless=BROWSER_HEADLESS, slow_mo=BROWSER_SLOW_MO,
@@ -136,6 +204,9 @@ async def main():
     # Слияние прогонов: по каждому URL — лучший результат, без дублей.
     # Ошибкой сайт числится, только если не открылся ни в одном прогоне.
     all_results = merge_runs(all_runs) if all_runs else []
+    for r in all_results:
+        if r.get("url") in error_urls:
+            r["from_errors"] = True
 
     if all_results:
         writer = ReportWriter(OUTPUT_FILE)
@@ -175,4 +246,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()) or 0)
