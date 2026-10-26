@@ -25,11 +25,10 @@ from modules.alerting import (EVENT_DOWN, EVENT_UP, apply_results,
                               mark_heartbeat, pick_alerts, run_line,
                               runlog_append, save_sheet_alert, save_state,
                               send)
-from modules.config import (CONTOUR, INPUT_FILE, LOG_FORMAT, LOG_LEVEL,
-                            MATTERMOST_WEBHOOK_URL, SHEET_URL, STATE_FILE)
+from modules.config import (CONTOUR, LOG_FORMAT, LOG_LEVEL,
+                            MATTERMOST_WEBHOOK_URL, STATE_FILE)
 from modules.probe import check_all
-from modules.sources import (EmptyTargetList, SheetUnavailable,
-                             contour_column, load_targets)
+from modules.sources import SheetUnavailable, contour_column, load_targets
 
 EXIT_SHEET_UNAVAILABLE = 3
 
@@ -54,9 +53,6 @@ def parse_args(argv):
         "--limit", type=_non_negative, default=0, metavar="N",
         help="проверить только первые N адресов; такая выборка не трогает "
              "состояние. 0 - весь список, боевой режим")
-    parser.add_argument(
-        "--input", default=None, metavar="ФАЙЛ",
-        help="откуда взять список, по умолчанию {}".format(INPUT_FILE.name))
     parser.add_argument(
         "--no-notify", action="store_true",
         help="не отправлять в Mattermost, даже если вебхук задан")
@@ -183,38 +179,30 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     setup_logging()
 
-    if SHEET_URL and args.input is None:
-        try:
-            contour_column(CONTOUR)
-        except ValueError as e:
-            logger.error("%s (DC_CONTOUR в .env)", e)
-            return 1
+    try:
+        contour_column(CONTOUR)
+    except ValueError as e:
+        logger.error("%s (DC_CONTOUR в .env)", e)
+        return 1
 
     try:
-        loaded = load_targets(limit=args.limit, path=args.input)
+        loaded = load_targets(limit=args.limit)
     except SheetUnavailable as e:
         logger.error("Google-таблица не прочитана: %s", e)
         # Выборку запускает человек в терминале, ему хватит строки выше.
         if not args.limit:
             report_sheet_down(str(e), args.no_notify)
         return EXIT_SHEET_UNAVAILABLE
-    except (EmptyTargetList, FileNotFoundError) as e:
-        # Трассировка стека здесь ничего не добавляет к тому, что файла нет
-        # или он пуст, а код возврата и так скажет вызывающему всё нужное.
-        logger.error("Список не загружен: %s", e)
-        return 1
 
     counts = loaded["counts"]
-    print("Целей: {} (внутренних {}, внешних {}, без метки {}, из списка "
-          "ошибок {}), отсеяно мусорных строк: {}".format(
+    print("Целей: {} (внутренних {}, внешних {}, из списка ошибок {}), "
+          "отсеяно мусорных строк: {}".format(
               len(loaded["targets"]), counts["internal"], counts["external"],
-              counts["unknown"], loaded.get("known_bad", 0),
-              len(loaded["skipped"])))
+              loaded["known_bad"], len(loaded["skipped"])))
 
     if args.limit:
         return run_sample(loaded, args.no_notify)
-    if loaded.get("source") == "sheet":
-        report_sheet_up(args.no_notify)
+    report_sheet_up(args.no_notify)
     return run_full(loaded, args.no_notify)
 
 

@@ -13,6 +13,7 @@ DC_STATE_FILE. У выбора есть цена: если файл теряет
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -78,7 +79,6 @@ def save_state(state: dict, path=None) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-        import os
         os.replace(tmp, path)
         return True
     except OSError as e:
@@ -100,7 +100,7 @@ def apply_results(state: dict, results: List[dict],
     проверяется.
     """
     confirm_fails = CONFIRM_FAILS if confirm_fails is None else confirm_fails
-    old = state.get("domains", {}) if isinstance(state, dict) else {}
+    old = state.get("domains", {})
     domains: Dict[str, dict] = {}
     events: List[dict] = []
     now = _stamp()
@@ -175,7 +175,7 @@ def apply_results(state: dict, results: List[dict],
                  "domains": domains}
     # Отметку о последнем признаке жизни переносим: без этого она терялась бы
     # каждый прогон, и heartbeat уходил бы в канал каждые пять минут.
-    if state.get("last_heartbeat") if isinstance(state, dict) else None:
+    if state.get("last_heartbeat"):
         new_state["last_heartbeat"] = state["last_heartbeat"]
     logger.info("События: упало %d, поднялось %d, ожило из списка ошибок %d",
                 sum(1 for e in events if e["event"] == EVENT_DOWN),

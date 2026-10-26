@@ -11,7 +11,6 @@
 машине проверки.
 """
 
-import logging
 from collections import Counter, OrderedDict
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -22,10 +21,9 @@ from ..probe.failures import (FAIL_DNS, FAIL_TLS, FAIL_TIMEOUT, FAIL_REFUSED,
                               FAIL_OTHER)
 from ..config import (GROUP_WINDOW_MINUTES, GUARD_MIN_ITEMS, LONE_DOWN_HOURS,
                      MASS_FAILURE_RATIO, MATTERMOST_TIMEOUT, REQUEST_TIMEOUT,
-                     now_msk)
+                     now_msk, short_stamp)
 from .notifier import send_to_mattermost
-
-logger = logging.getLogger(__name__)
+from .state import ALERT_GROUP, ALERT_LONE, EVENT_DOWN, EVENT_UP
 
 _CONTOUR_NAMES = {"internal": "внутренним контуром",
                   "external": "внешним контуром"}
@@ -121,14 +119,6 @@ def _short_alert(headline: str, body: str, checked: int,
         headline, body, _NO_LIST, _footer(checked, checked_at))
 
 
-def problems(results: List[dict]) -> List[dict]:
-    return [r for r in results if not r.get("ok")]
-
-
-def group_by_reason(results: List[dict]) -> "OrderedDict[str, List[dict]]":
-    return _group(results, reason_of)
-
-
 def build_alert(results: List[dict], checked_at: datetime = None,
                 contour_counts: Dict[str, int] = None) -> Optional[str]:
     """Сводка обо всех проблемных доменах. None, если проблемных нет.
@@ -137,7 +127,7 @@ def build_alert(results: List[dict], checked_at: datetime = None,
     здоровых доменах и есть требование этой версии.
     """
     main = [r for r in results if not r.get("known_bad")]
-    bad = problems(main)
+    bad = [r for r in main if not r.get("ok")]
     revived = [r for r in results if r.get("known_bad") and r.get("ok")]
     if not bad and not revived:
         return None
@@ -154,7 +144,7 @@ def build_alert(results: List[dict], checked_at: datetime = None,
             return guard + _revived_block(revived)
         lines += ["🔴 Домены: проблемных {} из {}".format(len(bad), len(main)),
                   ""]
-        lines += _render_groups(group_by_reason(bad))
+        lines += _render_groups(_group(bad, reason_of))
     if revived:
         lines += _revived_lines(revived)
     lines.append(_footer(len(results), checked_at,
@@ -238,7 +228,7 @@ def _mass_alert(items: List[dict], checked: int, checked_at: datetime,
     а не столько же независимых аварий. Перечень из сотен адресов в такой
     момент длинный, одинаковый и уводит от настоящей причины.
     """
-    if not checked or MASS_FAILURE_RATIO <= 0 or len(items) < GUARD_MIN_ITEMS:
+    if not checked or len(items) < GUARD_MIN_ITEMS:
         return None
     if len(items) / checked < MASS_FAILURE_RATIO:
         return None
@@ -289,9 +279,9 @@ def build_event_alert(events: List[dict], checked: int,
         return None
     checked_at = checked_at or now_msk()
     revived = [e for e in events if e.get("revived")]
-    fell = [e for e in events if e.get("event") == "down"]
+    fell = [e for e in events if e.get("event") == EVENT_DOWN]
     rose = [e for e in events
-            if e.get("event") == "up" and not e.get("revived")]
+            if e.get("event") == EVENT_UP and not e.get("revived")]
 
     guard = _guards(fell, rose, checked, checked_at, contour_counts)
     if guard is not None:
@@ -301,11 +291,11 @@ def build_event_alert(events: List[dict], checked: int,
     # Долгие одиночные падения и массовые отдельно: у них разный смысл.
     # Массовое на нынешних данных почти всегда сбой самой машины проверки,
     # и читатель должен видеть это первой строкой, а не вычислять по списку.
-    lone = [e for e in fell if e.get("alert") == "lone"]
-    rest = [e for e in fell if e.get("alert") != "lone"]
+    lone = [e for e in fell if e.get("alert") == ALERT_LONE]
+    rest = [e for e in fell if e.get("alert") != ALERT_LONE]
     if rest:
         lines.append("🔴 Упали: {}".format(len(rest)))
-        if any(e.get("alert") == "group" for e in rest):
+        if any(e.get("alert") == ALERT_GROUP for e in rest):
             lines.append("Разом, в пределах {} минут. Несколько независимых "
                          "аварий одновременно - редкость,\nначните с машины "
                          "проверки.".format(GROUP_WINDOW_MINUTES))
@@ -317,7 +307,7 @@ def build_event_alert(events: List[dict], checked: int,
             LONE_DOWN_HOURS, len(lone)))
         lines.append("")
         for e in lone:
-            since = (e.get("since") or "").replace("T", " ")[:16]
+            since = short_stamp(e.get("since"))
             title, plain = _explain(e.get("reason") or "причина не определена")
             lines.append("  {} - {}{}".format(
                 e["label"], title,
@@ -328,7 +318,7 @@ def build_event_alert(events: List[dict], checked: int,
     if rose:
         lines.append("🟢 Поднялись: {}".format(len(rose)))
         for e in rose:
-            since = (e.get("since") or "").replace("T", " ")[:16]
+            since = short_stamp(e.get("since"))
             lines.append("  {}{}".format(
                 e["label"],
                 " (не отвечал с {})".format(since) if since else ""))
@@ -364,7 +354,7 @@ def build_sheet_down(reason: str, checked_at: datetime = None) -> str:
 
 def build_sheet_up(since: str = None, checked_at: datetime = None) -> str:
     checked_at = checked_at or now_msk()
-    since = (since or "").replace("T", " ")[:16]
+    since = short_stamp(since)
     return ("🟢 Google-таблица снова читается, проверка доменов продолжается.\n"
             "{}\n{} МСК\n".format(
                 "Не читалась с {}.".format(since) if since else "",
@@ -375,21 +365,9 @@ def build_sheet_up(since: str = None, checked_at: datetime = None) -> str:
 # Отправка
 # ---------------------------------------------------------------------------
 
-def send(text: Optional[str], webhook_url: str, sender=None) -> bool:
-    """Отправляет готовый текст, молчит если текста нет.
-
-    Отправитель принимается параметром, чтобы тест мог подставить свой
-    и посчитать вызовы: проверить отсутствие отправки иначе нечем.
-    """
-    if text is None:
-        logger.info("Сообщать не о чем, отправку пропускаем")
-        return False
-    if not webhook_url:
-        logger.info("Вебхук не задан (DC_MATTERMOST_WEBHOOK), "
-                    "сообщение не отправляем")
-        return False
-    sender = send_to_mattermost if sender is None else sender
+def send(text: str, webhook_url: str) -> bool:
+    """Отправляет готовый текст. Есть ли что и куда слать, решает вызывающий."""
     # Тройные кавычки сохраняют моноширинное выравнивание: без них Mattermost
     # съедает отступы, и группировка по причинам разваливается.
-    return bool(sender(webhook_url, "```\n" + text + "```",
-                       timeout=MATTERMOST_TIMEOUT))
+    return send_to_mattermost(webhook_url, "```\n" + text + "```",
+                              timeout=MATTERMOST_TIMEOUT)

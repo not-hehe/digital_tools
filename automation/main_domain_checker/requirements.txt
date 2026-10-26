@@ -1,7 +1,4 @@
 requests>=2.31
-openpyxl==3.1.5
 
-# Всё. Отправка в Mattermost написана на stdlib, чтение Excel - на голом
-# openpyxl. pandas отсюда убран 10.09.2026: он тянулся ради двух вызовов
-# в читалке, а внутри всё равно работал openpyxl.
-# Проверялось на Python 3.9.6: requests 2.32.5, openpyxl 3.1.5.
+# Всё. Отправка в Mattermost и чтение Google-таблицы написаны на stdlib.
+# Проверялось на Python 3.9.6: requests 2.32.5.

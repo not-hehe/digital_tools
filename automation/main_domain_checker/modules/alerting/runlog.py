@@ -19,7 +19,9 @@
 import logging
 from typing import List
 
-from ..config import RUNLOG_FILE, RUNLOG_MAX_LINES, now_msk
+from ..config import RUNLOG_FILE, RUNLOG_MAX_LINES, now_msk, short_stamp
+from ..probe import reason_of
+from .state import EVENT_DOWN
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,7 @@ def run_line(results: List[dict]) -> str:
         body += " (из списка ошибок {})".format(len(failing) - len(named))
     if named:
         body += ": " + ", ".join(
-            "{} ({})".format(r.get("label") or r.get("url"), _reason_of(r))
+            "{} ({})".format(r.get("label") or r.get("url"), reason_of(r))
             for r in named)
     return _line(KIND_RUN, body)
 
@@ -62,16 +64,15 @@ def run_line(results: List[dict]) -> str:
 def event_lines(events: List[dict]) -> List[str]:
     lines = []
     for e in events:
-        if e.get("event") == "down":
+        if e.get("event") == EVENT_DOWN:
             lines.append(_line(KIND_DOWN, "{} - {}".format(
                 e.get("label"), e.get("reason") or "причина не определена")))
         elif e.get("revived"):
             lines.append(_line(KIND_REVIVED, "{} (из списка ошибок)".format(
                 e.get("label"))))
         else:
-            since = (e.get("since") or "").replace("T", " ")[:16]
             lines.append(_line(KIND_UP, "{} - не отвечал с {}".format(
-                e.get("label"), since or "неизвестно")))
+                e.get("label"), short_stamp(e.get("since")) or "неизвестно")))
     return lines
 
 
@@ -104,22 +105,3 @@ def _trim(path, max_lines: int) -> None:
             f.writelines(lines[-max_lines:])
     except OSError as e:
         logger.error("Лог прогонов не подрезан (%s): %s", path, e)
-
-
-def read_lines(path=None, kind: str = None) -> List[str]:
-    """Чтение для разбора: все строки или только одного вида записи."""
-    path = RUNLOG_FILE if path is None else path
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = [line.rstrip("\n") for line in f if line.strip()]
-    except OSError:
-        return []
-    if kind is None:
-        return lines
-    return [line for line in lines if line[21:29].strip() == kind]
-
-
-def _reason_of(result: dict) -> str:
-    # Импорт внутри: иначе alerting.runlog тянул бы probe на импорте модуля.
-    from ..probe import reason_of
-    return reason_of(result)

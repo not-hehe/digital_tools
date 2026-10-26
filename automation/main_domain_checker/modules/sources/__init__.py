@@ -1,16 +1,12 @@
 """Откуда берётся список доменов.
 
-Читает Excel, отсеивает мусор, схлопывает дубли, раздаёт метки контуров.
-Наружу отдаёт LoadResult - словарь с целями, отсеянными строками и счётчиками
-по контурам. Что внутри Excel и как он устроен, за пределы слоя не выходит.
+Читает Google-таблицу, отсеивает мусор, схлопывает дубли, раздаёт метки
+контуров и признак "из колонки ошибок". Наружу отдаёт LoadResult - словарь
+с целями, отсеянными строками и счётчиками по контурам. Что внутри таблицы
+и как она устроена, за пределы слоя не выходит.
 """
 
 from .sheet import SheetUnavailable, contour_column
-from .targets import (CONTOUR_EXTERNAL, CONTOUR_INTERNAL, CONTOUR_UNKNOWN,
-                      EmptyTargetList, count_by_contour, load_from_excel,
-                      load_from_sheet, load_targets, normalize_contour)
+from .targets import load_targets
 
-__all__ = ["load_targets", "load_from_excel", "load_from_sheet",
-           "EmptyTargetList", "SheetUnavailable", "contour_column",
-           "count_by_contour", "normalize_contour",
-           "CONTOUR_INTERNAL", "CONTOUR_EXTERNAL", "CONTOUR_UNKNOWN"]
+__all__ = ["load_targets", "SheetUnavailable", "contour_column"]

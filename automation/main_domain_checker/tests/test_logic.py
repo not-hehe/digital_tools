@@ -8,24 +8,25 @@
 забытый в нём, молча не выполняется, а раннер при этом рапортует об успехе.
 """
 
+import io
 import json
 import logging
 import re
+import socket
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import requests
-from openpyxl import Workbook
 
 from modules.alerting import alert, runlog as rl, state as st
 from modules.config import CONFIRM_FAILS
 from modules.probe import failures as f
-from modules.probe.checker import (blank_result, check_all, check_domain,
-                                   is_healthy, reason_of)
+from modules.probe.checker import blank_result, check_all, is_healthy, reason_of
 from modules.sources import sheet as sh, targets as tg
 from modules.urls import label_of, looks_like_url, normalize
 
@@ -42,8 +43,7 @@ def ok_result(label="a.example.com", code=200, contour="unknown"):
 def bad_result(label="b.example.com", code=None, kind=None, contour="unknown"):
     r = blank_result("https://" + label, label)
     r.update({"ok": False, "status_code": code, "contour": contour,
-              "failure_kind": kind,
-              "failure_label": f.failure_label(kind) if kind else None})
+              "failure_kind": kind})
     return r
 
 
@@ -53,15 +53,13 @@ def down_event(n, contour="unknown", reason="сервер не ответил"):
             for i in range(n)]
 
 
-def excel_with(rows, headers=("url", "contour")):
-    wb = Workbook()
-    ws = wb.active
-    ws.append(list(headers))
-    for row in rows:
-        ws.append(list(row))
-    path = Path(tempfile.mkdtemp()) / "list.xlsx"
-    wb.save(path)
-    return path
+def closed_url(path=""):
+    """Адрес закрытого локального порта: отказ соединения без выхода в сеть."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return "http://127.0.0.1:{}/{}".format(port, path)
 
 
 # ---------------------------------------------------------------------------
@@ -144,82 +142,9 @@ def test_normalize_and_looks_like_url():
         assert not looks_like_url(junk), junk
 
 
-def test_contour_aliases():
-    for value in ("internal", "INT", "внутренний", " ВН "):
-        assert tg.normalize_contour(value) == tg.CONTOUR_INTERNAL, value
-    for value in ("external", "ext", "ВНЕШНИЙ"):
-        assert tg.normalize_contour(value) == tg.CONTOUR_EXTERNAL, value
-    # Нераспознанное не угадываем: приписать домен не тому контуру хуже,
-    # чем признать, что метки нет.
-    for value in ("", None, "непонятно", "42"):
-        assert tg.normalize_contour(value) == tg.CONTOUR_UNKNOWN, value
-
-
-# ---------------------------------------------------------------------------
-# Загрузка списка
-# ---------------------------------------------------------------------------
-
-def test_loader_counts_and_dedup():
-    path = excel_with([
-        ("a.example.com", "internal"),
-        ("https://a.example.com/", "internal"),   # тот же сайт: схема и слэш
-        ("A.EXAMPLE.COM", "internal"),            # тот же сайт: регистр
-        ("b.example.com", "external"),
-        ("c.example.com", ""),
-        ("нет", "internal"),                      # мусор
-    ])
-    r = tg.load_from_excel(path=path)
-    assert [t["label"] for t in r["targets"]] == [
-        "a.example.com", "b.example.com", "c.example.com"]
-    assert r["skipped"] == ["нет"]
-    assert r["counts"] == {"internal": 1, "external": 1, "unknown": 1}
-    assert sum(r["counts"].values()) == len(r["targets"])
-
-
-def test_loader_without_contour_column():
-    """Старый файл без колонки должен грузиться как раньше."""
-    path = excel_with([("a.example.com",), ("b.example.com",)], headers=("url",))
-    r = tg.load_from_excel(path=path)
-    assert len(r["targets"]) == 2
-    assert r["counts"]["unknown"] == 2
-    assert all(t["contour"] == tg.CONTOUR_UNKNOWN for t in r["targets"])
-
-
-def test_loader_refuses_empty_list():
-    """Ноль целей это отказ, а не тихий прогон.
-
-    Иначе проверять нечего, событий нет, канал молчит - и при этом состояние
-    обнуляется целиком, унося память обо всех упавших доменах.
-    """
-    path = excel_with([], headers=("url", "contour"))
-    try:
-        tg.load_targets(path=path)
-    except tg.EmptyTargetList:
-        return
-    raise AssertionError("ожидался EmptyTargetList")
-
-
-def test_loader_reads_without_pandas():
-    """Читалка работает на голом openpyxl: pandas в зависимостях быть не должно.
-
-    Проверка не косметическая: pandas был самой тяжёлой зависимостью, и его
-    возврат через любой импорт сразу утяжелит установку на хосте.
-    """
-    path = excel_with([("a.example.com", "internal")])
-    assert len(tg.load_from_excel(path=path)["targets"]) == 1
-    assert "pandas" not in sys.modules
-
-
 # ---------------------------------------------------------------------------
 # Проверка домена
 # ---------------------------------------------------------------------------
-
-def test_check_domain_rejects_junk_without_network():
-    r = check_domain("нет")
-    assert r["failure_kind"] == f.FAIL_INVALID_URL
-    assert r["ok"] is False
-    assert r["status_code"] is None
-
 
 def test_check_all_survives_broken_target():
     """Одна битая цель не должна уносить весь прогон.
@@ -227,16 +152,19 @@ def test_check_all_survives_broken_target():
     Результатов обязано быть столько же, сколько целей: иначе сводка
     посчитает домены и не сойдётся с входным списком.
     """
-    targets = [{"url": "нет", "label": "нет"} for _ in range(5)]
+    targets = [{"url": closed_url(), "label": "closed{}".format(i)}
+               for i in range(5)]
     targets.append({"нет_ключа_url": "x"})
     results = check_all(targets, max_workers=2)
     assert len(results) == len(targets)
     assert all(r["ok"] is False for r in results)
+    assert results[0]["failure_kind"] == f.FAIL_REFUSED
+    assert results[-1]["failure_kind"] == f.FAIL_OTHER
 
 
 def test_check_all_keeps_order():
-    targets = [{"url": "junk{}".format(i), "label": "junk{}".format(i)}
-               for i in range(10)]
+    url = closed_url()
+    targets = [{"url": url, "label": "closed{}".format(i)} for i in range(10)]
     results = check_all(targets, max_workers=5)
     assert [r["label"] for r in results] == [t["label"] for t in targets]
 
@@ -353,36 +281,36 @@ def test_alert_explains_reason():
 # Отправка
 # ---------------------------------------------------------------------------
 
-def _counting_sender(calls):
-    return lambda *a, **kw: calls.append(a) or True
+def _report(text, webhook="https://mm.example.com/hooks/x", no_notify=False):
+    """main._report_sending с подставной отправкой: (результат, что ушло)."""
+    import main as entry
+    sent = []
+    saved = (entry.MATTERMOST_WEBHOOK_URL, entry.send)
+    entry.MATTERMOST_WEBHOOK_URL = webhook
+    entry.send = lambda text, url: sent.append(text) or True
+    try:
+        with redirect_stdout(io.StringIO()):
+            result = entry._report_sending(text, no_notify)
+    finally:
+        entry.MATTERMOST_WEBHOOK_URL, entry.send = saved
+    return result, sent
 
 
 def test_notify_silent_without_problems():
     """Главное требование версии: при здоровых доменах канал молчит."""
-    calls = []
-    sent = alert.send(alert.build_alert([ok_result("a.example.com")] * 3),
-                      "https://mm.example.com/hooks/x",
-                      sender=_counting_sender(calls))
-    assert calls == []
-    assert sent is False
+    assert _report(alert.build_alert([ok_result("a.example.com")] * 3)) == (False, [])
 
 
 def test_notify_sends_when_problem_exists():
-    calls = []
     text = alert.build_alert([ok_result("a.example.com"),
                               bad_result("b.example.com", code=500)])
-    sent = alert.send(text, "https://mm.example.com/hooks/x",
-                      sender=_counting_sender(calls))
-    assert len(calls) == 1
-    assert sent is True
+    assert _report(text) == (True, [text])
 
 
-def test_notify_skips_without_webhook():
-    calls = []
-    sent = alert.send(alert.build_alert([bad_result(code=500)]), "",
-                      sender=_counting_sender(calls))
-    assert calls == []
-    assert sent is False
+def test_notify_skips_without_webhook_or_with_flag():
+    text = alert.build_alert([bad_result(code=500)])
+    assert _report(text, webhook="") == (False, [])
+    assert _report(text, no_notify=True) == (False, [])
 
 
 # ---------------------------------------------------------------------------
@@ -599,22 +527,29 @@ def test_event_alert_separates_lone_and_group():
 # Лог прогонов и событий
 # ---------------------------------------------------------------------------
 
+def _log_lines(path, kind=None):
+    """Строки журнала; kind - только записи этого вида (колонка 22-29)."""
+    lines = [line for line in Path(path).read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    return lines if kind is None else [l for l in lines if l[21:29].strip() == kind]
+
+
 def test_runlog_writes_run_and_events():
     tmp = Path(tempfile.mkdtemp()) / "runs.log"
     results = [ok_result("a.example.com"), bad_result("b.example.com", code=503)]
     s, events = st.apply_results(st.empty_state(), results, confirm_fails=1)
     assert rl.append([rl.run_line(results)] + rl.event_lines(events), path=tmp)
-    lines = rl.read_lines(tmp)
+    lines = _log_lines(tmp)
     assert len(lines) == 2
     assert lines[0].endswith("прогон    проверено 2, не ответили 1: b.example.com (HTTP 503)")
     assert lines[1].endswith("упал      b.example.com - HTTP 503")
     s, events = st.apply_results(s, [ok_result("b.example.com")])
     rl.append(rl.event_lines(events), path=tmp)
-    assert "поднялся  b.example.com - не отвечал с 20" in rl.read_lines(tmp)[2]
+    assert "поднялся  b.example.com - не отвечал с 20" in _log_lines(tmp)[2]
     # Строка на прогон пишется и когда событий нет: по ним считают ритм.
     assert rl.append([rl.run_line([ok_result("a.example.com")])], path=tmp)
-    assert len(rl.read_lines(tmp, kind="прогон")) == 2
-    assert rl.read_lines(tmp, kind="прогон")[1].endswith("проверено 1, не ответили 0")
+    assert len(_log_lines(tmp, "прогон")) == 2
+    assert _log_lines(tmp, "прогон")[1].endswith("проверено 1, не ответили 0")
 
 
 def test_runlog_is_trimmed_with_slack():
@@ -622,18 +557,17 @@ def test_runlog_is_trimmed_with_slack():
     tmp = Path(tempfile.mkdtemp()) / "runs.log"
     for i in range(10):
         rl.append(["строка {}".format(i)], path=tmp, max_lines=10)
-    assert len(rl.read_lines(tmp)) == 10
+    assert len(_log_lines(tmp)) == 10
     rl.append(["строка 10"], path=tmp, max_lines=10)
-    assert len(rl.read_lines(tmp)) == 11, "в пределах запаса файл не трогаем"
+    assert len(_log_lines(tmp)) == 11, "в пределах запаса файл не трогаем"
     rl.append(["строка 11"], path=tmp, max_lines=10)
-    assert rl.read_lines(tmp) == ["строка {}".format(i) for i in range(2, 12)], \
+    assert _log_lines(tmp) == ["строка {}".format(i) for i in range(2, 12)], \
         "за пределом запаса остаётся хвост"
 
 
 def test_runlog_failure_does_not_raise():
     missing_dir = Path(tempfile.mkdtemp()) / "нет" / "runs.log"
     assert rl.append(["строка"], path=missing_dir) is False
-    assert rl.read_lines(missing_dir) == []
 
 
 def test_heartbeat_with_broken_stamp_is_due():
@@ -797,8 +731,8 @@ def test_load_from_sheet_contour_first_and_junk_skipped():
     assert got == {"out.example.com": ("external", False),
                    "both.example.com": ("external", False),
                    "dead.example.com": ("external", True)}
-    assert loaded["source"] == "sheet" and loaded["known_bad"] == 1
-    assert loaded["counts"]["external"] == 2
+    assert loaded["known_bad"] == 1
+    assert loaded["counts"] == {"internal": 0, "external": 2}
     assert sorted(loaded["skipped"]) == ["нет", "уточняется"]
 
     inner = tg.load_from_sheet(SHEET, contour=2, opener=_opener(body=_SHEET_BODY))
@@ -815,6 +749,52 @@ def test_load_from_sheet_empty_contour_is_sheet_failure():
         assert 'в колонке "внешний" нет ни одного адреса' in str(e)
     else:
         raise AssertionError("пустой контур должен давать SheetUnavailable")
+
+
+def test_load_from_sheet_dedups_same_site_on_stdlib():
+    """Схема, регистр и хвостовой слэш не делают из одного сайта три.
+
+    Список читается на stdlib: тяжёлых библиотек в зависимостях быть не должно,
+    их возврат через любой импорт сразу утяжелит установку на хосте.
+    """
+    body = _csv(["ошибки", "внутренний", "внешний"],
+                ["", "", "a.example.com"],
+                ["", "", "https://a.example.com/"],
+                ["", "", "A.EXAMPLE.COM"],
+                ["", "", "b.example.com"])
+    r = tg.load_from_sheet(SHEET, contour=1, opener=_opener(body=body))
+    assert [t["label"] for t in r["targets"]] == ["a.example.com", "b.example.com"]
+    assert r["counts"] == {"internal": 0, "external": 2}
+    assert "pandas" not in sys.modules and "openpyxl" not in sys.modules
+
+
+def test_load_targets_limit_recounts_everything():
+    """Выборка описывает то, что реально проверено: и контуры, и колонку ошибок."""
+    saved = (tg.SHEET_URL, tg.read_sheet)
+    try:
+        tg.SHEET_URL = SHEET
+        tg.read_sheet = lambda url, opener=None: sh.parse_columns(
+            _SHEET_BODY.decode("utf-8"))
+        full = tg.load_targets()
+        assert (len(full["targets"]), full["known_bad"]) == (3, 1)
+        cut = tg.load_targets(limit=2)
+        assert [t["label"] for t in cut["targets"]] == ["out.example.com",
+                                                        "both.example.com"]
+        assert cut["counts"] == {"internal": 0, "external": 2}
+        assert cut["known_bad"] == 0
+    finally:
+        tg.SHEET_URL, tg.read_sheet = saved
+
+
+def test_load_from_sheet_without_url_is_sheet_failure():
+    opener = _opener(body=_SHEET_BODY)
+    try:
+        tg.load_from_sheet("", contour=1, opener=opener)
+    except sh.SheetUnavailable as e:
+        assert "ссылка на таблицу не задана" in str(e)
+    else:
+        raise AssertionError("без ссылки должен быть SheetUnavailable")
+    assert opener.calls == [], "без ссылки в сеть не ходим"
 
 
 def _known_bad(label, ok):
@@ -884,20 +864,23 @@ def test_sheet_alert_once_then_recovery():
     tmp = Path(tempfile.mkdtemp())
     sent = []
     saved = (st.STATE_FILE, entry.MATTERMOST_WEBHOOK_URL, entry.send,
-             entry.SHEET_URL, tg.SHEET_URL, tg.read_sheet, entry.run_full)
+             tg.SHEET_URL, tg.read_sheet, entry.run_full)
     try:
         st.STATE_FILE = tmp / "state.json"
         entry.MATTERMOST_WEBHOOK_URL = "http://127.0.0.1:9/test"
         entry.send = lambda text, url: sent.append(text) or True
-        entry.SHEET_URL = tg.SHEET_URL = SHEET
+
+        # Нет ссылки - тот же сбой таблицы: код 3 и одно сообщение.
+        tg.SHEET_URL = ""
+        assert entry.main([]) == 3
+        assert len(sent) == 1 and "ссылка на таблицу не задана" in sent[0]
+        assert (tmp / "sheet_alert.json").exists()
 
         def broken(url, opener=None):
             raise sh.SheetUnavailable("таблица закрыта")
+        tg.SHEET_URL = SHEET
         tg.read_sheet = broken
-        assert entry.main([]) == 3
-        assert entry.main([]) == 3
-        assert len(sent) == 1 and "Причина: таблица закрыта" in sent[0]
-        assert (tmp / "sheet_alert.json").exists()
+        assert entry.main([]) == 3 and len(sent) == 1, "о сбое уже сообщено"
         # Выборку запускает человек: в канал не пишем.
         assert entry.main(["--limit", "3"]) == 3 and len(sent) == 1
 
@@ -908,9 +891,13 @@ def test_sheet_alert_once_then_recovery():
         assert len(sent) == 2 and "снова читается" in sent[1]
         assert not (tmp / "sheet_alert.json").exists()
         assert entry.main([]) == 0 and len(sent) == 2
+
+        tg.read_sheet = broken
+        assert entry.main([]) == 3
+        assert len(sent) == 3 and "Причина: таблица закрыта" in sent[2]
     finally:
         (st.STATE_FILE, entry.MATTERMOST_WEBHOOK_URL, entry.send,
-         entry.SHEET_URL, tg.SHEET_URL, tg.read_sheet, entry.run_full) = saved
+         tg.SHEET_URL, tg.read_sheet, entry.run_full) = saved
 
 
 # ---------------------------------------------------------------------------
