@@ -45,6 +45,11 @@ def normalize(url: str) -> str:
     return url
 
 
+def site_key(url: str) -> str:
+    """Ключ сайта для отсева дублей: без схемы, в нижнем регистре, без «/» в конце."""
+    return _SCHEME_RE.sub("", normalize(url)).lower().rstrip("/")
+
+
 def looks_like_url(url: str) -> bool:
     """Похожа ли строка на адрес сайта.
 

@@ -10,7 +10,6 @@ from .config import (
     STATUS_BROKEN,
     STATUS_SUSPICIOUS,
     STATUS_NONE,
-    GA_POSITIVE_STATUSES,
 )
 
 # Идентификатор ресурса Universal Analytics. Система отключена: сбор данных
@@ -30,11 +29,6 @@ def classify_site(has_collect: bool,
     if has_error_telemetry:
         return STATUS_SUSPICIOUS
     return STATUS_NONE
-
-
-def is_ga_positive(status: str) -> bool:
-    """True, если сайт с таким статусом считается имеющим Google Analytics."""
-    return status in GA_POSITIVE_STATUSES
 
 
 def is_universal_analytics(container_id: Optional[str]) -> bool:

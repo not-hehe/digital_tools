@@ -132,7 +132,6 @@ async def run_checks(http_port: int, https_port: int):
         "MAP www.dead.test ~NOTFOUND",
     ])
     bm = BrowserManager(
-        headless=True, slow_mo=0, block_resources=False,
         max_concurrent_pages=4, allow_legacy_tls=True,
         extra_launch_args=[f"--host-resolver-rules={rules}",
                            "--no-proxy-server"])
@@ -180,7 +179,7 @@ def main():
     r = results["flaky.test"]
     check("503 добит повторами до 200",
           r["status"] == cfg.STATUS_BROKEN and r["http_status"] == 200,
-          f"{r['status']} / HTTP {r['http_status']} / попыток {r['attempts']}")
+          f"{r['status']} / HTTP {r['http_status']}")
 
     r = results["httponly.test"]
     check("сайт без рабочего TLS открыт по http",

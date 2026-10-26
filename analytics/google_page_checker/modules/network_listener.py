@@ -1,6 +1,5 @@
 import logging
 import re
-import time
 from typing import Any, Dict, List, Optional, Callable
 
 from playwright.async_api import Page, Request, Response
@@ -41,9 +40,6 @@ class NetworkListener:
         # и HTTP-статус приписывался чужой записи. Объект как ключ заодно
         # удерживает ссылку, так что переиспользования адреса не будет.
         self._by_request: Dict[Any, dict] = {}
-        # Запасной индекс по URL: нужен, когда до response.request
-        # добраться не удалось (см. _handle_response).
-        self._by_url: Dict[str, List[dict]] = {}
         self._request_handler: Optional[Callable] = None
         self._response_handler: Optional[Callable] = None
 
@@ -52,7 +48,6 @@ class NetworkListener:
             return
         self._requests.clear()
         self._by_request.clear()
-        self._by_url.clear()
         self._request_handler = self._handle_request
         self._response_handler = self._handle_response
         self.page.on("request", self._request_handler)
@@ -75,68 +70,24 @@ class NetworkListener:
         return KIND_OTHER
 
     async def _handle_request(self, request: Request):
-        try:
-            url = request.url
-        except Exception:
-            # Объект запроса пришёл в непригодном виде (известный дефект
-            # playwright-python 1.40). Улику теряем, но прогон не роняем.
-            return
+        url = request.url
         if not any(p.search(url) for p in self.ga_patterns):
             return
         req = {
             "url": url,
             "status": None,  # заполнится в _handle_response, если ответ придёт
-            "method": request.method,
-            "timestamp": time.time(),
             "kind": self._classify_url(url),
         }
-        try:
-            post_data = request.post_data
-            if post_data:
-                req["post_data"] = post_data
-        except Exception:
-            pass
         self._requests.append(req)
-        try:
-            self._by_request[request] = req
-        except TypeError:
-            # Объект нехешируемый — обойдёмся индексом по URL.
-            pass
-        self._by_url.setdefault(url, []).append(req)
+        self._by_request[request] = req
         logger.debug("Google-запрос (%s): %s", req["kind"], url)
 
     async def _handle_response(self, response: Response):
-        """Дозаполняет HTTP-статус ранее зафиксированного запроса.
-
-        ``response.request`` в playwright-python 1.40 умеет падать с
-        ``'dict' object has no attribute '_object'``, если объект запроса
-        уже освобождён. В боевом логе это ловилось десяток раз за прогон и
-        роняло всю попытку загрузки сайта. Здесь падение локализовано:
-        не получилось достать запрос — сопоставляем по URL ответа.
-        """
-        req = None
-        try:
-            req = self._by_request.get(response.request)
-        except Exception as e:
-            logger.debug("response.request недоступен (%s) — "
-                         "сопоставляем по URL", e)
-        if req is None:
-            try:
-                url = response.url
-            except Exception:
-                return
-            # Первая запись с этим URL, у которой статуса ещё нет:
-            # ответы приходят в том же порядке, что и запросы.
-            for candidate in self._by_url.get(url, ()):
-                if candidate["status"] is None:
-                    req = candidate
-                    break
+        """Дозаполняет HTTP-статус ранее зафиксированного запроса."""
+        req = self._by_request.get(response.request)
         if req is None:
             return
-        try:
-            req["status"] = response.status
-        except Exception:
-            pass
+        req["status"] = response.status
 
     def get_ga_requests(self) -> List[dict]:
         """Все Google-запросы, КРОМЕ error-телеметрии (прежнее поведение)."""
@@ -149,7 +100,3 @@ class NetworkListener:
     def get_error_requests(self) -> List[dict]:
         """Только служебная телеметрия ошибок (t=error&_e=exc)."""
         return [r for r in self._requests if r["kind"] == KIND_ERROR_TELEMETRY]
-
-    def get_all_requests(self) -> List[dict]:
-        """Вообще все пойманные Google-запросы, включая error-телеметрию."""
-        return self._requests.copy()

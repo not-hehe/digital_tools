@@ -34,7 +34,7 @@ logging.disable(logging.CRITICAL)
 
 import re  # noqa: E402
 from modules import config as cfg  # noqa: E402
-from modules.classifier import classify_site, is_ga_positive  # noqa: E402
+from modules.classifier import classify_site  # noqa: E402
 from modules.network_listener import (NetworkListener, KIND_COLLECT,  # noqa: E402
                                       KIND_ERROR_TELEMETRY, KIND_OTHER)
 import modules.page_worker as page_worker_module  # noqa: E402
@@ -52,10 +52,8 @@ from modules.report_writer import ReportWriter  # noqa: E402
 # ---------------------------------------------------------------------------
 
 class FakeRequest:
-    def __init__(self, url, method="POST"):
+    def __init__(self, url):
         self.url = url
-        self.method = method
-        self.post_data = None
 
 
 class FakeResp:
@@ -66,17 +64,6 @@ class FakeResp:
         self.request = FakeRequest(url)
 
 
-class BrokenResp(FakeResp):
-    """Ответ, у которого .request падает, — воспроизводит дефект
-    playwright-python 1.40 ('dict' object has no attribute '_object')."""
-
-    @property
-    def request(self):
-        raise AttributeError("'dict' object has no attribute '_object'")
-
-    @request.setter
-    def request(self, value):
-        self._request = value
 
 
 class FakeContextRequest:
@@ -233,7 +220,7 @@ COLLECT_NOANSWER = FakeResp("https://www.google-analytics.com/g/collect?v=2&tid=
 
 def test_config_patterns():
     """Regex-группы конфига: компиляция и разделение хиты/телеметрия/прочее."""
-    for group in (cfg.GA_PATTERNS, cfg.GA_COLLECT_PATTERNS, cfg.HTML_GTM_PATTERNS):
+    for group in (cfg.GA_PATTERNS, cfg.GA_COLLECT_PATTERNS):
         for p in group:
             re.compile(p)
 
@@ -280,12 +267,6 @@ def test_classifier():
     for combo in product([True, False], repeat=3):
         assert classify_site(*combo) == expected[combo], combo
 
-    assert is_ga_positive(cfg.STATUS_WORKING)
-    assert is_ga_positive(cfg.STATUS_BROKEN)
-    assert not is_ga_positive(cfg.STATUS_SUSPICIOUS)
-    assert not is_ga_positive(cfg.STATUS_NONE)
-    assert not is_ga_positive(cfg.STATUS_ERROR)
-
 
 def test_failures_taxonomy():
     """Разбор текста ошибки на вид отказа + политика повторов."""
@@ -303,14 +284,12 @@ def test_failures_taxonomy():
         # прерванная навигация — не «порт закрыт»: перебирать адреса
         # и советовать «проверьте порт» здесь неправильно
         "net::ERR_ABORTED": f.FAIL_BROWSER,
-        "net::ERR_HTTP_RESPONSE_CODE_FAILURE": f.FAIL_HTTP,
         "net::ERR_TOO_MANY_REDIRECTS": f.FAIL_REDIRECT_LOOP,
         "net::ERR_INVALID_AUTH_CREDENTIALS": f.FAIL_AUTH_REQUIRED,
         "net::ERR_TUNNEL_CONNECTION_FAILED": f.FAIL_PROXY,
         "net::ERR_PROXY_CONNECTION_FAILED": f.FAIL_PROXY,
         "Protocol error (Page.navigate): Cannot navigate to invalid URL":
             f.FAIL_INVALID_URL,
-        "'dict' object has no attribute '_object'": f.FAIL_BROWSER,
         "что-то невиданное": f.FAIL_OTHER,
     }
     for text, kind in cases.items():
@@ -355,7 +334,7 @@ def test_url_variants():
     assert normalize("http://example.com") == "http://example.com"
     assert normalize("  example.com  ") == "https://example.com"
 
-    # мусорные ячейки Excel до браузера доходить не должны
+    # мусорные ячейки таблицы до браузера доходить не должны
     for junk in ("нет", "lkb2b", "уточняется", "-", ""):
         assert not looks_like_url(junk), junk
     for good in ("example.com", "https://a.b.example.com/path?x=1", "localhost:8080",
@@ -399,11 +378,10 @@ def test_network_listener():
     loop.run_until_complete(listener._handle_request(COLLECT_NOANSWER.request))
     loop.close()
 
-    assert len(listener.get_all_requests()) == 4          # css отсеян
     assert len(listener.get_collect_requests()) == 2
     assert len(listener.get_error_requests()) == 1
     assert len(listener.get_ga_requests()) == 3           # всё, кроме телеметрии
-    kinds = {r["kind"] for r in listener.get_all_requests()}
+    kinds = {r["kind"] for r in listener.get_ga_requests() + listener.get_error_requests()}
     assert kinds == {KIND_COLLECT, KIND_ERROR_TELEMETRY, KIND_OTHER}
 
     dead = [r for r in listener.get_ga_requests() if r["kind"] == KIND_OTHER]
@@ -411,25 +389,6 @@ def test_network_listener():
     answered = [r for r in listener.get_collect_requests() if r["status"] == 204]
     silent = [r for r in listener.get_collect_requests() if r["status"] is None]
     assert len(answered) == 1 and len(silent) == 1         # попытка без ответа учтена
-
-
-def test_network_listener_broken_response():
-    """Дефект playwright 1.40: response.request падает.
-
-    Статус всё равно должен проставиться — по URL ответа, а исключение
-    не должно уходить наружу и ронять попытку загрузки сайта.
-    """
-    listener = NetworkListener(page=None, ga_patterns=cfg.GA_PATTERNS)
-    url = "https://www.googletagmanager.com/gtm.js?id=GTM-AB12CD"
-    broken = BrokenResp(url, 404)
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(listener._handle_request(FakeRequest(url)))
-    loop.run_until_complete(listener._handle_response(broken))  # не падает
-    loop.close()
-
-    requests = listener.get_ga_requests()
-    assert len(requests) == 1
-    assert requests[0]["status"] == 404, "статус не восстановлен по URL"
 
 
 def test_find_html_markers():
@@ -469,28 +428,28 @@ def _real_gotos(page):
 def test_page_worker():
     """Основные сценарии: WORKING/BROKEN(x2)/SUSPICIOUS/NONE/ERROR."""
     r = _run_worker(FakePage([COLLECT, GTM404], GTM_HTML))
-    assert r["status"] == cfg.STATUS_WORKING and r["has_ga"]
+    assert r["status"] == cfg.STATUS_WORKING
 
     r = _run_worker(FakePage([GTM404, ERRTEL], GTM_HTML))
-    assert r["status"] == cfg.STATUS_BROKEN and r["has_ga"]
+    assert r["status"] == cfg.STATUS_BROKEN
 
     r = _run_worker(FakePage([], GTM_HTML))       # тег есть, в сети тишина
-    assert r["status"] == cfg.STATUS_BROKEN and r["has_ga"]
+    assert r["status"] == cfg.STATUS_BROKEN
     assert r["container_id"] == "GTM-AB12CD"
 
     r = _run_worker(FakePage([ERRTEL], CLEAN_HTML))
-    assert r["status"] == cfg.STATUS_SUSPICIOUS and not r["has_ga"]
+    assert r["status"] == cfg.STATUS_SUSPICIOUS
 
     # хит отправлен, но endpoint не ответил — аналитика на сайте есть
     r = _run_worker(FakePage([COLLECT_NOANSWER], CLEAN_HTML))
-    assert r["status"] == cfg.STATUS_WORKING and r["has_ga"]
+    assert r["status"] == cfg.STATUS_WORKING
 
     r = _run_worker(FakePage([], CLEAN_HTML))
-    assert r["status"] == cfg.STATUS_NONE and not r["has_ga"]
+    assert r["status"] == cfg.STATUS_NONE
 
     # только слабые упоминания в вёрстке, сети нет -> NONE, а не BROKEN
     r = _run_worker(FakePage([], WEAK_HTML))
-    assert r["status"] == cfg.STATUS_NONE and not r["has_ga"]
+    assert r["status"] == cfg.STATUS_NONE
     assert any(m["strength"] == "weak" for m in r["html_markers"])
 
     r = _run_worker(FakePage([], CLEAN_HTML, fail="net::ERR_CONNECTION_RESET"))
@@ -617,9 +576,9 @@ def test_report_writer():
         # gudok при молчащей сети: улику добыл зонд
         _run_worker(FakePage([], GTM_HTML, probe_status=404)),
         _run_worker(FakePage([], CLEAN_HTML, fail=True)),
-        # словарь старого формата (без 'status') — из аварийного фолбэка
-        {"url": "https://legacy.ru", "has_ga": False, "ga_requests": [],
-         "error": "RuntimeError: boom"},
+        # словарь из аварийного фолбэка
+        {"url": "https://legacy.ru", "status": cfg.STATUS_ERROR,
+         "ga_requests": [], "error": "RuntimeError: boom"},
     ]
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "report.txt"
@@ -937,76 +896,6 @@ def test_summary_report():
     assert "\n\n" not in text
 
 
-def test_excel_reader():
-    """Мультилистовое чтение: гэпы <25 проходим, 25+ — переход на лист."""
-    try:
-        import openpyxl
-    except ImportError:
-        print("SKIP test_excel_reader: нет openpyxl")
-        return
-    from modules.excel_reader import read_urls_from_excel
-
-    wb = openpyxl.Workbook()
-    ws1 = wb.active
-    ws1.title = "Лист1"
-    ws1.append(["url"])
-    ws1.append(["https://a.ru"])
-    for _ in range(3):                # маленький разрыв — проходим насквозь
-        ws1.append([None])
-    ws1.append(["https://b.ru"])
-    for _ in range(25):               # 25 пустых подряд — конец листа
-        ws1.append([None])
-    ws1.append(["https://hidden.ru"])  # за разрывом — НЕ читается
-
-    ws2 = wb.create_sheet("Лист2")    # второй лист тоже читается
-    ws2.append(["url"])
-    ws2.append(["https://c.ru"])
-    ws2.append(["https://a.ru"])      # дубль с первого листа — отсеется
-    # «грязные» ячейки — реальные случаи из боевого списка:
-    ws2.append(["  https://spaced.ru  "])                 # лишние пробелы
-    ws2.append(["https://travel.example.com / tg.example.com"])       # два URL в ячейке
-    ws2.append(["one.ru, two.ru; three.ru"])              # список в ячейке
-    ws2.append(["https://other pay.example.com"])            # мусорное слово + URL
-    ws2.append(["https://xn--80aswg.xn--p1ai"])           # punycode-домен
-    ws2.append(["https://query.ru?utm=1"])                # query без пути
-    ws2.append(["lk b2b"])                                # домена нет вовсе
-    # дубли в другой записи: без схемы / в другом регистре / список
-    # «запятая или точка с запятой С ПРОБЕЛОМ» — ничего нового не дадут
-    ws2.append(["a.ru; ONE.RU, https://TWO.ru"])
-
-    ws3 = wb.create_sheet("Служебный")  # листа без колонки url — пропуск
-    ws3.append(["комментарий"])
-    ws3.append(["не трогать"])
-
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "input.xlsx"
-        wb.save(path)
-
-        urls = list(read_urls_from_excel(path))
-        assert urls == [
-            "https://a.ru", "https://b.ru",           # Лист1 до разрыва
-            "https://c.ru",                           # Лист2 (a.ru — дубль)
-            "https://spaced.ru",                      # пробелы обрезаны
-            "https://travel.example.com", "tg.example.com",       # ячейка разделена
-            "one.ru", "two.ru", "three.ru",           # список разделён
-            "pay.example.com",                           # мусорное слово убрано
-            "https://xn--80aswg.xn--p1ai",            # punycode не обрезан
-            "https://query.ru?utm=1",                 # query сохранён
-            "lkb2b",                                  # без домена: до браузера
-        ], urls                                       # не дойдёт (invalid_url)
-
-        # старое поведение: конкретный лист по имени
-        only2 = list(read_urls_from_excel(path, sheet_name="Лист2"))
-        assert only2[:2] == ["https://c.ru", "https://a.ru"]
-
-        # нет колонки ни на одном листе -> ошибка
-        try:
-            list(read_urls_from_excel(path, column_name="нет_такой"))
-            assert False, "ожидали ValueError"
-        except ValueError:
-            pass
-
-
 def test_aggregator():
     """Слияние прогонов: лучший результат на URL, без дублей, порядок."""
     from modules.aggregator import merge_runs, has_network_evidence
@@ -1153,16 +1042,16 @@ def test_browser_manager_semaphore():
     bm = BrowserManager(max_concurrent_pages=limit)
     state = {"active": 0, "peak": 0}
 
+    class FakePg:
+        async def close(self):
+            state["active"] -= 1
+
     async def fake_new_page():
         state["active"] += 1
         state["peak"] = max(state["peak"], state["active"])
-        return object()
-
-    async def fake_close_page(page):
-        state["active"] -= 1
+        return FakePg()
 
     bm.new_page = fake_new_page       # подменяем реальный браузер
-    bm.close_page = fake_close_page
 
     async def use_page():
         async with bm.page_context():
@@ -1203,7 +1092,7 @@ def test_main_error_fallback():
         [results, results])
     assert len(merged) == 2, "нормализация адреса не спасла от дублей"
 
-    bm = BrowserManager()
+    bm = BrowserManager(max_concurrent_pages=1)
     assert not bm.is_alive()                       # браузер не запускался
     bm._browser = types.SimpleNamespace(is_connected=lambda: True)
     assert bm.is_alive()
@@ -1215,17 +1104,16 @@ def test_browser_launch_args():
     """Устаревший TLS разрешён — иначе сайты на TLS 1.0/1.1 не открыть."""
     from modules.browser_manager import BrowserManager
 
-    args = BrowserManager(allow_legacy_tls=True, headless=True)._launch_args()
+    args = BrowserManager(1, allow_legacy_tls=True)._launch_args()
     assert "--ssl-version-min=tls1" in args
     assert "--ignore-certificate-errors" in args
     assert "--headless=new" in args
 
-    args = BrowserManager(allow_legacy_tls=False, headless=False)._launch_args()
+    args = BrowserManager(1, allow_legacy_tls=False)._launch_args()
     assert "--ssl-version-min=tls1" not in args
-    assert "--headless=new" not in args
 
     # точка расширения под разделение на контуры
-    args = BrowserManager(extra_launch_args=["--host-resolver-rules=X"])._launch_args()
+    args = BrowserManager(1, extra_launch_args=["--host-resolver-rules=X"])._launch_args()
     assert "--host-resolver-rules=X" in args
 
 
@@ -1320,7 +1208,7 @@ def test_build_targets():
         raise AssertionError("контур 3 принят")
     except ValueError:
         pass
-    # Excel-путь: тот же отсев без таблицы
+    # clean_urls отдельно: дубль по регистру и хвостовому «/»
     cleaned, skipped = m.clean_urls(["a.ru", "A.RU/", "нет", ""])
     assert cleaned == ["https://a.ru"] and skipped == 2, (cleaned, skipped)
 
@@ -1399,6 +1287,15 @@ def test_main_sheet_unavailable():
                                     "external": ["нет"]}
         assert asyncio.run(m.main()) == 1
         assert sent and 'в колонке "внешний" нет ни одного адреса' in sent[-1], sent
+
+        sent.clear()
+        m.SHEET_URL = ""
+
+        def no_read(url):
+            raise AssertionError("таблица читалась без ссылки")
+        m.read_sheet = no_read
+        assert asyncio.run(m.main()) == 1
+        assert sent and "ссылка на таблицу не задана" in sent[-1], sent
     finally:
         for n, v in saved.items():
             setattr(m, n, v)
@@ -1411,7 +1308,6 @@ def main():
         test_failures_taxonomy,
         test_url_variants,
         test_network_listener,
-        test_network_listener_broken_response,
         test_find_html_markers,
         test_page_worker,
         test_no_retry_on_permanent_failure,
@@ -1427,7 +1323,6 @@ def main():
         test_targeted_wait,
         test_probe,
         test_summary_report,
-        test_excel_reader,
         test_aggregator,
         test_aggregator_markup_rank,
         test_notifier,

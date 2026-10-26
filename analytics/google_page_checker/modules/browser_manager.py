@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, List, Optional
 
 from playwright.async_api import (
-    async_playwright, Browser, BrowserContext, Page, Playwright, Route, Request
+    async_playwright, Browser, BrowserContext, Page, Playwright
 )
 
 logger = logging.getLogger(__name__)
@@ -15,24 +15,17 @@ class BrowserManager:
     """
     Управляет жизненным циклом браузера Chromium с антидетект-настройками.
     Позволяет:
-    - запускать браузер в headless-режиме или с интерфейсом;
+    - запускать браузер в headless-режиме;
     - внедрять JavaScript-код для сокрытия признаков автоматизации (stealth);
     - ограничивать число одновременно открытых страниц (семафор;
       лимит действует при работе через page_context);
-    - блокировать загрузку ресурсов (изображения, стили, шрифты) для ускорения;
     - разрешать устаревшие версии TLS, чтобы сайты на TLS 1.0/1.1 вообще
       открывались, а не отваливались с ERR_SSL_VERSION_OR_CIPHER_MISMATCH;
     - использовать контекстные менеджеры для автоматического закрытия страниц и браузера.
     """
 
-    def __init__(self, headless=False, slow_mo=100, viewport=None,
-                 user_agent=None, block_resources=True, max_concurrent_pages=5,
-                 allow_legacy_tls=True, extra_launch_args=None):
-        self.headless = headless
-        self.slow_mo = slow_mo
-        self.viewport = viewport or {"width": 1920, "height": 1080}
-        self.user_agent = user_agent
-        self.block_resources = block_resources
+    def __init__(self, max_concurrent_pages, allow_legacy_tls=True,
+                 extra_launch_args=None):
         self.max_concurrent_pages = max_concurrent_pages
         self.allow_legacy_tls = allow_legacy_tls
         # Точка расширения: сюда попадут, например, --host-resolver-rules,
@@ -61,22 +54,20 @@ class BrowserManager:
                 "--ignore-certificate-errors",
                 "--allow-insecure-localhost",
             ]
-        if self.headless:
-            args += ["--headless=new", "--window-size=1920,1080",
-                     "--start-maximized"]
+        args += ["--headless=new", "--window-size=1920,1080",
+                 "--start-maximized"]
         args += self.extra_launch_args
         return args
 
     async def start(self):
         self._playwright = await async_playwright().start()
         launch_options = {
-            "headless": self.headless,
-            "slow_mo": self.slow_mo,
+            "headless": True,
             "args": self._launch_args(),
         }
         self._browser = await self._playwright.chromium.launch(**launch_options)
         context_options = {
-            "viewport": self.viewport,
+            "viewport": {"width": 1920, "height": 1080},
             "locale": "ru-RU",
             "timezone_id": "Europe/Moscow",
             "permissions": ["geolocation"],
@@ -88,8 +79,6 @@ class BrowserManager:
             "accept_downloads": False,
             "ignore_https_errors": True,
         }
-        if self.user_agent:
-            context_options["user_agent"] = self.user_agent
         self._context = await self._browser.new_context(**context_options)
         logger.info("Браузер запущен")
 
@@ -107,24 +96,12 @@ class BrowserManager:
             logger.warning("Stealth не применён: %s", e)
 
     async def new_page(self) -> Page:
-        if not self._context:
-            await self.start()
         page = await self._context.new_page()
         # Раньше stealth вешался ещё и обработчиком на событие 'page'
         # контекста: скрипт добавлялся дважды, причём вторая установка
         # гонялась с началом навигации. Ставим ровно один раз и здесь.
         await self._apply_stealth(page)
-        if self.block_resources:
-            await self._block_resources_only(page)
         return page
-
-    async def _block_resources_only(self, page: Page):
-        async def handle(route: Route, request: Request):
-            if request.resource_type in {"image", "stylesheet", "font", "media"}:
-                await route.abort()
-            else:
-                await route.continue_()
-        await page.route("**/*", handle)
 
     def is_alive(self) -> bool:
         """Жив ли браузер.
@@ -140,12 +117,6 @@ class BrowserManager:
             return self._browser.is_connected()
         except Exception:
             return False
-
-    async def close_page(self, page: Page):
-        try:
-            await page.close()
-        except Exception:
-            pass
 
     async def close(self):
         try:
@@ -163,7 +134,10 @@ class BrowserManager:
             try:
                 yield page
             finally:
-                await self.close_page(page)
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     async def __aenter__(self):
         await self.start()

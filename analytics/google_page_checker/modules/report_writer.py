@@ -22,12 +22,7 @@ def _shorten(text: str, limit: int = _URL_LIMIT) -> str:
 
 
 def _status_of(result: Dict) -> str:
-    status = result.get("status")
-    if status:
-        return status
-    if result.get("error"):
-        return STATUS_ERROR
-    return STATUS_WORKING if result.get("has_ga") else STATUS_NONE
+    return result["status"]
 
 
 def group_failures(results: List[Dict]) -> "OrderedDict[str, List[Dict]]":

@@ -6,18 +6,16 @@ from typing import List, Optional
 
 from .browser_manager import BrowserManager
 from .network_listener import NetworkListener
-from .classifier import (classify_site, is_ga_positive, is_universal_analytics,
-                         UA_ID_RE)
+from .classifier import classify_site, is_universal_analytics, UA_ID_RE
 from .failures import (classify_failure, failure_label, is_retryable,
-                       worth_alternate_url, FAIL_INVALID_URL, FAIL_HTTP,
-                       FAIL_OTHER)
+                       worth_alternate_url, FAIL_INVALID_URL, FAIL_OTHER)
 from .url_variants import normalize, looks_like_url, alternate_urls
 from .config import (GA_PATTERNS, HTML_GTM_STRONG_PATTERNS, HTML_GTM_WEAK_PATTERNS,
                      NAV_WAIT_UNTIL, LOAD_STATE_TIMEOUT,
                      NETWORKIDLE_TIMEOUT, MIN_WAIT_AFTER_LOAD,
                      TARGETED_WAIT_TIMEOUT, PROBE_TIMEOUT,
                      PAGE_TIMEOUT, MAX_RETRIES, RETRY_PAUSE,
-                     ANALYZE_HTTP_ERRORS, HTTP_TRANSIENT_CODES,
+                     HTTP_TRANSIENT_CODES,
                      STATUS_ERROR, STATUS_BROKEN,
                      BROKEN_CONTAINER_DELETED, BROKEN_LOADS_NO_HITS,
                      BROKEN_NO_RESPONSE, BROKEN_NOT_LOADED,
@@ -215,9 +213,7 @@ def _blank_result(url: str) -> dict:
     return {
         "url": url,
         "opened_url": None,      # вариант адреса, которым сайт удалось открыть
-        "final_url": None,       # адрес после всех редиректов
         "status": None,
-        "has_ga": False,
         "broken_reason": None,
         "http_status": None,
         "http_error": False,     # сервер ответил кодом >= 400
@@ -227,17 +223,14 @@ def _blank_result(url: str) -> dict:
         "error_requests": [],
         "html_markers": [],
         "probe": None,
-        "attempts": 0,
         "tried_urls": [],
         "failure_kind": None,
-        "failure_label": None,
         "error": None,
     }
 
 
 def build_error_result(url: str, error: str, failure_kind: str = None,
-                       tried_urls: List[str] = None,
-                       attempts: int = 0) -> dict:
+                       tried_urls: List[str] = None) -> dict:
     """Результат «сайт открыть не удалось» с разобранной причиной."""
     result = _blank_result(url)
     kind = failure_kind or classify_failure(error)
@@ -245,9 +238,7 @@ def build_error_result(url: str, error: str, failure_kind: str = None,
         "status": STATUS_ERROR,
         "error": error,
         "failure_kind": kind,
-        "failure_label": failure_label(kind),
         "tried_urls": list(tried_urls or [url]),
-        "attempts": attempts,
     })
     return result
 
@@ -288,7 +279,6 @@ class PageWorker:
             tried: List[str] = []
             last_error = None
             last_kind = FAIL_OTHER
-            total_attempts = 0
 
             while queue and len(tried) < _MAX_URL_VARIANTS:
                 candidate = queue.pop(0)
@@ -304,14 +294,11 @@ class PageWorker:
                     await self._reset_page(page)
                 tried.append(candidate)
 
-                result, error, kind, attempts = await self._try_url(page,
-                                                                    candidate)
-                total_attempts += attempts
+                result, error, kind = await self._try_url(page, candidate)
                 if result is not None:
                     result["url"] = raw_url
                     result["opened_url"] = candidate
                     result["tried_urls"] = list(tried)
-                    result["attempts"] = total_attempts
                     if candidate != raw_url:
                         logger.info("%s: открылся альтернативным адресом %s",
                                     raw_url, candidate)
@@ -329,8 +316,7 @@ class PageWorker:
             logger.error("Не удалось загрузить %s (%s): %s",
                          raw_url, failure_label(last_kind), last_error)
             return build_error_result(raw_url, last_error, last_kind,
-                                      tried_urls=tried,
-                                      attempts=total_attempts)
+                                      tried_urls=tried)
 
     @staticmethod
     async def _reset_page(page) -> None:
@@ -362,10 +348,9 @@ class PageWorker:
     async def _try_url(self, page, url: str):
         """Пробует открыть конкретный адрес с повторами.
 
-        Возвращает кортеж (result, error, failure_kind, attempts):
+        Возвращает кортеж (result, error, failure_kind):
         result заполнен, если страница открылась (в том числе с кодом
-        ошибки при ANALYZE_HTTP_ERRORS); иначе result=None, а error и
-        failure_kind описывают отказ.
+        ошибки); иначе result=None, а error и failure_kind описывают отказ.
         """
         last_error = None
         last_kind = FAIL_OTHER
@@ -391,11 +376,6 @@ class PageWorker:
                         listener.stop()
                         await asyncio.sleep(RETRY_PAUSE)
                         continue
-                    if not ANALYZE_HTTP_ERRORS:
-                        listener.stop()
-                        return (None,
-                                f"Главная страница вернула HTTP {main_status}",
-                                FAIL_HTTP, attempt)
                     # Сервер ответил — страница есть, разбираем её как обычно
                     # и помечаем результат кодом ответа.
                     logger.info("%s: HTTP %s — страница есть, разбираем "
@@ -403,7 +383,7 @@ class PageWorker:
 
                 result = await self._analyze_page(page, listener, url,
                                                   main_status)
-                return result, None, None, attempt
+                return result, None, None
 
             except Exception as e:
                 last_error = str(e)
@@ -423,7 +403,7 @@ class PageWorker:
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_PAUSE)
 
-        return None, last_error, last_kind, attempt
+        return None, last_error, last_kind
 
     # ------------------------------------------------------------------
     # Разбор открытой страницы
@@ -520,20 +500,13 @@ class PageWorker:
             len(error_requests),
         )
 
-        try:
-            final_url = page.url
-        except Exception:
-            final_url = url
-
         result = _blank_result(url)
         result.update({
             "status": status,
-            "has_ga": is_ga_positive(status),
             "broken_reason": broken_reason,
             "http_status": main_status,
             "http_error": http_error,
             "container_id": container_id,
-            "final_url": final_url,
             "ga_requests": ga_requests,
             "collect_requests": collect_requests,
             "error_requests": error_requests,

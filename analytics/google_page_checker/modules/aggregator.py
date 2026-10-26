@@ -24,10 +24,7 @@ def has_strong_markers(result: Dict) -> bool:
 
 def _is_error(result: Dict) -> bool:
     """Прогон по сайту закончился ошибкой (страница не открылась)."""
-    status = result.get("status")
-    if status:
-        return status == STATUS_ERROR
-    return bool(result.get("error"))
+    return result.get("status") == STATUS_ERROR
 
 
 def _rank(result: Dict) -> int:
@@ -112,20 +109,3 @@ def merge_runs(runs: List[List[Dict]]) -> List[Dict]:
     logger.info("Слияние прогонов: %d -> %d уникальных URL",
                 sum(len(run) for run in runs), len(merged))
     return merged
-
-
-def run_improved(previous: List[Dict], merged: List[Dict]) -> bool:
-    """Дал ли очередной прогон хоть что-то новое.
-
-    Сравниваются ранги по каждому URL. Используется только для логов:
-    прогонов фиксированное число (RUN_COUNT), но в журнале полезно видеть,
-    на каком прогоне картина перестала меняться.
-    """
-    if not previous:
-        return True
-    before = {r.get("url"): _score(r) for r in previous}
-    for result in merged:
-        url = result.get("url")
-        if url not in before or _score(result) > before[url]:
-            return True
-    return False

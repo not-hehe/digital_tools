@@ -12,7 +12,6 @@ FAIL_REDIRECT_LOOP = "redirect_loop"  # бесконечная цепочка р
 FAIL_AUTH_REQUIRED = "auth_required"  # сервер требует учётные данные
 FAIL_PROXY = "proxy"                # не удалось пройти через прокси
 FAIL_INVALID_URL = "invalid_url"    # адрес синтаксически не является URL
-FAIL_HTTP = "http_error"            # сервер ответил кодом >= 400
 FAIL_BROWSER = "browser"            # сбой самого Playwright/Chromium
 FAIL_OTHER = "other"                # не распознано
 
@@ -25,7 +24,6 @@ FAILURE_LABELS = {
     FAIL_AUTH_REQUIRED: "требуются учётные данные (HTTP-авторизация)",
     FAIL_PROXY: "прокси не пропустил соединение",
     FAIL_INVALID_URL: "строка не является адресом (мусор во входных данных)",
-    FAIL_HTTP: "сервер ответил кодом ошибки",
     FAIL_BROWSER: "сбой браузера при обработке страницы",
     FAIL_OTHER: "прочая ошибка загрузки",
 }
@@ -39,8 +37,7 @@ FAILURE_HINTS = {
     FAIL_REDIRECT_LOOP: "чаще всего цикл авторизации — нужна ручная проверка",
     FAIL_AUTH_REQUIRED: "закрыто HTTP-авторизацией, нужны учётные данные",
     FAIL_PROXY: "адрес не входит в разрешённые прокси — проверить контур",
-    FAIL_INVALID_URL: "исправить ячейку во входном Excel",
-    FAIL_HTTP: "сервер отвечает, но кодом ошибки — проверить маршрут",
+    FAIL_INVALID_URL: "исправить ячейку в Google-таблице",
     FAIL_BROWSER: "транзиентный сбой, повторить прогон",
     FAIL_OTHER: "разобрать вручную",
 }
@@ -48,7 +45,6 @@ FAILURE_HINTS = {
 # Порядок вывода групп в отчёте: сверху то, что чинится нашими силами.
 FAILURE_ORDER = (
     FAIL_INVALID_URL,
-    FAIL_HTTP,
     FAIL_AUTH_REQUIRED,
     FAIL_PROXY,
     FAIL_TLS,
@@ -81,8 +77,6 @@ _PATTERNS = (
     (FAIL_TLS, re.compile(r"ERR_SSL|ERR_CERT|ERR_BAD_SSL|ERR_TLS")),
     (FAIL_TIMEOUT, re.compile(r"ERR_TIMED_OUT|ERR_CONNECTION_TIMED_OUT"
                               r"|Timeout \d+ms exceeded")),
-    # Сервер ответил, но кодом ошибки, — это не отказ соединения.
-    (FAIL_HTTP, re.compile(r"ERR_HTTP_RESPONSE_CODE_FAILURE")),
     (FAIL_REFUSED, re.compile(r"ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET"
                               r"|ERR_CONNECTION_CLOSED|ERR_CONNECTION_ABORTED"
                               r"|ERR_EMPTY_RESPONSE"
@@ -95,12 +89,7 @@ _PATTERNS = (
     (FAIL_INVALID_URL, re.compile(r"Cannot navigate to invalid URL"
                                   r"|Protocol error \(Page\.navigate\)"
                                   r"|invalid URL")),
-    # Известный дефект playwright-python 1.40: при разборе ответа на уже
-    # освобождённый запрос Response.request падает на сыром словаре
-    # инициализатора. Лечится обновлением библиотеки, но встречать его
-    # мы должны как транзиентный сбой браузера, а не как «сайт недоступен».
-    (FAIL_BROWSER, re.compile(r"'dict' object has no attribute '_object'"
-                              r"|Target (page|closed|crashed)"
+    (FAIL_BROWSER, re.compile(r"Target (page|closed|crashed)"
                               r"|Target closed"
                               r"|browser has been closed"
                               r"|Execution context was destroyed"
@@ -120,7 +109,7 @@ _PATTERNS = (
 )
 
 # Отказы, которые повторная попытка в принципе может исправить.
-# Всё остальное детерминировано: DNS-записи и мусор в Excel за пять секунд
+# Всё остальное детерминировано: DNS-записи и мусор в таблице за пять секунд
 # не меняются, а три попытки по 45 секунд на каждый такой адрес и съедали
 # основную часть времени прогона.
 RETRYABLE = frozenset({FAIL_TIMEOUT, FAIL_REFUSED, FAIL_BROWSER, FAIL_PROXY,
