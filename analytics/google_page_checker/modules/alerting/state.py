@@ -34,12 +34,14 @@ def _stamp(now: Optional[datetime] = None) -> str:
 
 def empty_state() -> dict:
     return {"version": STATE_VERSION, "updated_at": None, "last_heartbeat": None,
-            "sites": {}}
+            "baseline_at": None, "sheet_alert": None, "sites": {}}
 
 
 def load_state(path: Path) -> Tuple[dict, bool]:
     """(память, первый ли это запуск). Битый файл - как его отсутствие:
-    чекер начинает заново и сообщает об этом, а не падает каждую неделю."""
+    чекер начинает заново и сообщает об этом, а не падает каждую неделю.
+    Первый запуск - пока не было ни одного полного прогона: одна лишь отметка
+    о сбое таблицы наблюдения не начинает."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -50,7 +52,7 @@ def load_state(path: Path) -> Tuple[dict, bool]:
     if not isinstance(data, dict) or not isinstance(data.get("sites"), dict):
         logger.warning("Память %s не того формата, начинаю наблюдение заново", path)
         return empty_state(), True
-    return data, False
+    return data, not data.get("baseline_at")
 
 
 def save_state(state: dict, path: Path) -> bool:
@@ -67,10 +69,11 @@ def save_state(state: dict, path: Path) -> bool:
     return True
 
 
-def _event(kind: str, r: dict, rec: dict, new: bool = False) -> dict:
+def _event(kind: str, r: dict, rec: dict, new: bool = False, revived: bool = False) -> dict:
     return {"event": kind, "url": r.get("url"), "status": r.get("status"),
             "container": r.get("container_id"), "was_container": rec.get("container"),
-            "from_errors": bool(r.get("from_errors")), "new": new}
+            "from_errors": bool(r.get("from_errors")), "new": new, "revived": revived,
+            "returned": kind == EVENT_APPEARED and bool(rec.get("lost_at"))}
 
 
 def apply_results(state: dict, results: List[dict], first_run: bool,
@@ -82,6 +85,8 @@ def apply_results(state: dict, results: List[dict], first_run: bool,
     согласия может один раз скрыть счётчик.
     """
     stamp = _stamp(now)
+    if first_run:
+        state["baseline_at"] = stamp
     sites: Dict[str, dict] = state.setdefault("sites", {})
     events: List[dict] = []
     seen = set()
@@ -96,7 +101,11 @@ def apply_results(state: dict, results: List[dict], first_run: bool,
         if rec is None:
             rec = {"ga": ga, "misses": 0, "since": stamp, "container": None}
             sites[url] = rec
-            if ga and not first_run:
+            if ga and first_run and r.get("from_errors"):
+                # Как «Ожили из списка ошибок» у domain_checker: о живом сайте из колонки
+                # ошибок сообщается и в первом прогоне.
+                events.append(_event(EVENT_APPEARED, r, rec, revived=True))
+            elif ga and not first_run:
                 events.append(_event(EVENT_APPEARED, r, rec, new=True))
         elif not opened:
             continue
@@ -104,7 +113,13 @@ def apply_results(state: dict, results: List[dict], first_run: bool,
             if rec.get("ga") is False:
                 events.append(_event(EVENT_APPEARED, r, rec))
                 rec["since"] = stamp
+                rec.pop("lost_at", None)
             elif rec.get("ga") is None:
+                # Сайт из колонки ошибок лежал и ожил сразу с Google - сообщаем, как domain.
+                # Обычный сайт, лежавший при первом прогоне, молчит: Google у него, скорее
+                # всего, был и раньше.
+                if r.get("from_errors"):
+                    events.append(_event(EVENT_APPEARED, r, rec, revived=True))
                 rec["since"] = stamp
             rec["ga"], rec["misses"] = True, 0
         elif rec.get("ga") is True:
@@ -112,6 +127,9 @@ def apply_results(state: dict, results: List[dict], first_run: bool,
             if rec["misses"] >= confirm_lost:
                 events.append(_event(EVENT_LOST, r, rec))
                 rec["ga"], rec["misses"], rec["since"] = False, 0, stamp
+                # Вернётся - это «Google снова виден», а не новое появление: по этой
+                # отметке защита от лавины отличает возвращение сети от выкатки GA.
+                rec["lost_at"] = stamp
         elif rec.get("ga") is None:
             rec["ga"], rec["since"] = False, stamp
         if opened:
@@ -122,6 +140,22 @@ def apply_results(state: dict, results: List[dict], first_run: bool,
     for url in [u for u in sites if u not in seen]:
         del sites[url]
     return state, events
+
+
+def mark_sheet_failure(state: dict, reason: str) -> bool:
+    """True, если о сбое таблицы ещё не сообщали: как у domain_checker, сообщение
+    одно, дальше тишина до починки."""
+    if state.get("sheet_alert"):
+        return False
+    state["sheet_alert"] = {"since": _stamp(), "reason": reason}
+    return True
+
+
+def clear_sheet_failure(state: dict) -> Optional[str]:
+    """С какого времени таблица не читалась, если об этом сообщали; отметка снимается."""
+    alert = state.get("sheet_alert")
+    state["sheet_alert"] = None
+    return alert.get("since") if alert else None
 
 
 def due_for_heartbeat(state: dict, every_hours: int, now: Optional[datetime] = None) -> bool:

@@ -1256,9 +1256,12 @@ def test_main_sheet_unavailable():
 
     sent, saved = [], {}
     names = ("SHEET_URL", "CONTOUR", "MATTERMOST_WEBHOOK_URL", "BrowserManager",
-             "send_to_mattermost", "setup_logging", "read_sheet")
+             "send_to_mattermost", "setup_logging", "read_sheet", "STATE_FILE")
     for n in names:
         saved[n] = getattr(m, n)
+    tmp = tempfile.TemporaryDirectory()
+    # Каждый сценарий - первый сбой: о повторном сбое сообщение не уходит.
+    fresh = iter(Path(tmp.name) / "state{}.json".format(i) for i in range(10))
 
     def boom(*a, **k):
         raise AssertionError("браузер запущен")
@@ -1273,6 +1276,7 @@ def test_main_sheet_unavailable():
         m.setup_logging = lambda: None
         m.send_to_mattermost = lambda url, text, timeout=10: sent.append(text)
         m.read_sheet = closed
+        m.STATE_FILE = next(fresh)
         assert asyncio.run(m.main()) == 1
         assert sent == ["```\n⚠️ GA-чекер: не удалось прочитать Google-таблицу "
                         "со списком\n\nПричина: таблица закрыта\n```"], sent
@@ -1283,6 +1287,7 @@ def test_main_sheet_unavailable():
         assert asyncio.run(m.main()) == 1 and not sent, "неверный контур: код 1 без отправки"
 
         m.CONTOUR = 1
+        m.STATE_FILE = next(fresh)
         m.read_sheet = lambda url: {"errors": ["dead.example.com"],
                                     "internal": ["in.example.com"],
                                     "external": ["нет"]}
@@ -1291,6 +1296,7 @@ def test_main_sheet_unavailable():
 
         sent.clear()
         m.SHEET_URL = ""
+        m.STATE_FILE = next(fresh)
 
         def no_read(url):
             raise AssertionError("таблица читалась без ссылки")
@@ -1300,6 +1306,7 @@ def test_main_sheet_unavailable():
     finally:
         for n, v in saved.items():
             setattr(m, n, v)
+        tmp.cleanup()
 
 
 
@@ -1456,6 +1463,168 @@ def test_alert_message_keeps_summary_header():
     assert body[0] == "🟢 Появилась Google-аналитика: 1" and body[1].startswith("  https://a.example.com"), body
     assert body[-2:] == ["КОНЕЦ ОТЧЁТА", "```"], body
 
+
+def test_alert_revived_from_errors_column():
+    """Как у domain: сайт из колонки ошибок лежал и ожил с Google - отдельный блок
+    с просьбой перенести; ожил без Google - тишина; обычный лежавший сайт - тишина."""
+    from modules.alerting import build_message, empty_state
+    e1, e2, c = "https://dead1.example.com", "https://dead2.example.com", "https://c.example.com"
+    first = [_site(e1, None, from_errors=True), _site(e2, None, from_errors=True), _site(c, None)]
+    state, events = _run(empty_state(), first, first=True)
+    assert events == []
+    now = [_site(e1, True, container="GTM-BACK1", from_errors=True),
+           _site(e2, False, from_errors=True), _site(c, True)]
+    state, events = _run(state, now)
+    assert [(e["url"], e["revived"]) for e in events] == [(e1, True)], events
+    text = build_message(state, events, now, False, 10, 0.5, 24)
+    lines = text.splitlines()
+    i = lines.index("🟢 Ожили из списка ошибок, Google есть: 1")
+    assert lines[i + 1] == "  https://dead1.example.com (WORKING, GTM-BACK1)", lines
+    assert lines[i + 2] == 'Перенесите их в таблице из колонки "ошибки" в колонку контура.', lines
+    assert "Появилась" not in text and "c.example.com" not in text and "dead2" not in text, text
+
+
+def test_alert_revived_reported_on_first_run_and_not_hidden_by_guard():
+    from modules.alerting import build_message, empty_state
+    e1 = "https://dead1.example.com"
+    first = [_site("https://a.example.com", True), _site(e1, True, from_errors=True)]
+    state, events = _run(empty_state(), first, first=True)
+    assert [e["url"] for e in events] == [e1] and events[0]["revived"]
+    text = build_message(state, events, first, True, 10, 0.5, 24)
+    assert "начал следить" in text and "Ожили из списка ошибок, Google есть: 1" in text, text
+    urls = ["https://s{}.example.com".format(i) for i in range(20)]
+    e2 = "https://dead2.example.com"
+    state, _ = _run(empty_state(), [_site(u, True) for u in urls] + [_site(e2, None, from_errors=True)],
+                    first=True)
+    now = [_site(u, False) for u in urls[:12]] + [_site(u, True) for u in urls[12:]] + \
+          [_site(e2, True, from_errors=True)]
+    state, events = _run(state, now, confirm=1)
+    text = build_message(state, events, now, False, 10, 0.5, 24)
+    assert "Похоже, дело в самом чекере: Google пропал сразу у 12 из 20 сайтов" in text, text
+    assert "Ожили из списка ошибок, Google есть: 1" in text and "dead2.example.com" in text, text
+
+
+def test_alert_new_sites_are_listed_not_guarded():
+    """Добавили в таблицу много сайтов с Google - это не «чекер снова видит сеть»."""
+    from modules.alerting import build_message, empty_state
+    old = [_site("https://o{}.example.com".format(i), True) for i in range(5)]
+    state, _ = _run(empty_state(), old, first=True)
+    new = [_site("https://n{}.example.com".format(i), True) for i in range(20)]
+    state, events = _run(state, old + new)
+    text = build_message(state, events, old + new, False, 10, 0.5, 24)
+    assert "снова виден" not in text, text
+    assert "🟢 Появилась Google-аналитика: 20" in text and text.count("новый в списке") == 20, text
+
+
+
+def test_alert_rollout_is_listed_not_guarded():
+    """Google впервые появился разом у многих сайтов (выкатка на платформе) - это список,
+    а «снова виден» - только про сайты, которые его теряли."""
+    from modules.alerting import build_message, empty_state
+    urls = ["https://p{}.example.com".format(i) for i in range(13)]
+    state, _ = _run(empty_state(), [_site(u, False) for u in urls] + [_site("https://g.example.com", True)],
+                    first=True)
+    now = [_site(u, True) for u in urls[:12]] + [_site(urls[12], False), _site("https://g.example.com", True)]
+    state, events = _run(state, now)
+    text = build_message(state, events, now, False, 10, 0.5, 24)
+    assert "снова виден" not in text and "🟢 Появилась Google-аналитика: 12" in text, text
+    assert "p0.example.com" in text, text
+
+def test_alert_guard_counts_sites_from_memory():
+    """Сайт с Google, который сейчас не открылся, остаётся в знаменателе «из N»."""
+    from modules.alerting import build_message, empty_state
+    urls = ["https://s{}.example.com".format(i) for i in range(20)]
+    state, _ = _run(empty_state(), [_site(u, True) for u in urls], first=True)
+    now = [_site(u, None) for u in urls[:10]] + [_site(u, False) for u in urls[10:]]
+    state, events = _run(state, now, confirm=1)
+    text = build_message(state, events, now, False, 10, 0.5, 24)
+    assert "Google пропал сразу у 10 из 20 сайтов" in text, text
+
+
+def _main_stubs(m, tmp, sent):
+    class FakeBM:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def is_alive(self):
+            return True
+
+    async def fake_process(urls, bm):
+        return [_site(u, u.startswith("https://a")) for u in urls]
+    m.SHEET_URL, m.CONTOUR, m.RUN_COUNT = "https://docs.google.com/spreadsheets/d/x/edit", 1, 1
+    m.MATTERMOST_WEBHOOK_URL = "http://127.0.0.1:9/hooks/t"
+    m.BrowserManager, m.process_urls, m.setup_logging = FakeBM, fake_process, lambda: None
+    m.send_to_mattermost = lambda url, text, timeout=10: sent.append(text)
+    m.read_sheet = lambda url: {"errors": [], "internal": [], "external": ["a.example.com", "b.example.com"]}
+    m.OUTPUT_FILE, m.SUMMARY_FILE = Path(tmp) / "r.txt", Path(tmp) / "s.txt"
+
+
+_MAIN_NAMES = ("SHEET_URL", "CONTOUR", "MATTERMOST_WEBHOOK_URL", "BrowserManager", "send_to_mattermost",
+               "setup_logging", "read_sheet", "process_urls", "STATE_FILE", "RUN_COUNT",
+               "OUTPUT_FILE", "SUMMARY_FILE")
+
+
+def test_main_state_not_saved_says_so_every_run():
+    """Память не пишется: не «начал следить» каждый раз, а «память не сохранена» и код 1."""
+    import main as m
+    saved = {n: getattr(m, n) for n in _MAIN_NAMES}
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            _main_stubs(m, tmp, sent)
+            blocker = Path(tmp) / "file"
+            blocker.write_text("x", encoding="utf-8")
+            m.STATE_FILE = blocker / "state.json"
+            for _ in range(2):
+                assert asyncio.run(m.main()) == 1
+            assert len(sent) == 2 and all("память не сохранена" in s for s in sent), sent
+            assert not any("начал следить" in s for s in sent), sent
+            assert sent[0].startswith("```\n=== ОТЧЁТ ПО НАЛИЧИЮ GOOGLE ANALYTICS ===")
+        finally:
+            for n, v in saved.items():
+                setattr(m, n, v)
+
+
+def test_main_sheet_failure_once_then_back():
+    """Как у domain: о сбое таблицы одно сообщение, о починке - ещё одно; наблюдение начинается
+    с первого полного прогона, а не с отметки о сбое."""
+    import main as m
+    from modules.sources.sheet import SheetUnavailable
+    saved = {n: getattr(m, n) for n in _MAIN_NAMES}
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            _main_stubs(m, tmp, sent)
+            m.STATE_FILE = Path(tmp) / "state.json"
+            good = m.read_sheet
+
+            def closed(url):
+                raise SheetUnavailable("таблица закрыта")
+            m.read_sheet = closed
+            assert asyncio.run(m.main()) == 1 and asyncio.run(m.main()) == 1
+            assert len(sent) == 1 and "не удалось прочитать Google-таблицу" in sent[0], sent
+            m.read_sheet = good
+            assert asyncio.run(m.main()) is None
+            assert len(sent) == 3, sent
+            assert "Google-таблица снова читается" in sent[1], sent
+            assert "начал следить" in sent[2] and "новый в списке" not in sent[2], sent
+            assert asyncio.run(m.main()) is None and len(sent) == 3, "дальше тишина"
+            m.MATTERMOST_WEBHOOK_URL = ""
+            m.read_sheet = closed
+            assert asyncio.run(m.main()) == 1
+            m.MATTERMOST_WEBHOOK_URL, m.read_sheet = "http://127.0.0.1:9/hooks/t", good
+            assert asyncio.run(m.main()) is None
+            assert not any("снова читается" in s for s in sent[3:]), "без вебхука сбой не отмечается"
+        finally:
+            for n, v in saved.items():
+                setattr(m, n, v)
+
 def test_alert_state_file_roundtrip_and_broken():
     from modules.alerting import empty_state, load_state, save_state
     with tempfile.TemporaryDirectory() as tmp:
@@ -1463,6 +1632,10 @@ def test_alert_state_file_roundtrip_and_broken():
         state, first = load_state(path)
         assert first and state == empty_state()
         state["sites"]["https://a.example.com"] = {"ga": True, "misses": 0}
+        assert save_state(state, path)
+        again, first = load_state(path)
+        assert first, "без полного прогона наблюдение не начато"
+        state["baseline_at"] = "2026-10-28T09:00:00"
         assert save_state(state, path)
         again, first = load_state(path)
         assert not first and again["sites"] == state["sites"] and again["updated_at"]
@@ -1577,6 +1750,13 @@ def main():
         test_alert_mass_loss_guard,
         test_alert_heartbeat_and_silence,
         test_alert_message_keeps_summary_header,
+        test_alert_revived_from_errors_column,
+        test_alert_revived_reported_on_first_run_and_not_hidden_by_guard,
+        test_alert_new_sites_are_listed_not_guarded,
+        test_alert_guard_counts_sites_from_memory,
+        test_alert_rollout_is_listed_not_guarded,
+        test_main_state_not_saved_says_so_every_run,
+        test_main_sheet_failure_once_then_back,
         test_alert_state_file_roundtrip_and_broken,
         test_main_alerts_only_changes,
     ]

@@ -5,9 +5,10 @@
 остальные прогоны канал не трогают, кроме признака жизни раз в сутки.
 """
 
-from .alert import build_message
-from .state import (EVENT_APPEARED, EVENT_LOST, apply_results, empty_state,
-                    load_state, save_state)
+from .alert import build_message, build_sheet_back, build_state_failure
+from .state import (EVENT_APPEARED, EVENT_LOST, apply_results, clear_sheet_failure,
+                    empty_state, load_state, mark_sheet_failure, save_state)
 
-__all__ = ["apply_results", "build_message", "empty_state", "load_state",
+__all__ = ["apply_results", "build_message", "build_sheet_back", "build_state_failure",
+           "clear_sheet_failure", "empty_state", "load_state", "mark_sheet_failure",
            "save_state", "EVENT_APPEARED", "EVENT_LOST"]

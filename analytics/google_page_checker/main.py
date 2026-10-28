@@ -14,7 +14,9 @@ from modules.config import (OUTPUT_FILE, SUMMARY_FILE,
                             STATUS_NONE, STATUS_ERROR, STATE_FILE,
                             LOST_CONFIRM_RUNS, GUARD_MIN_ITEMS,
                             MASS_FAILURE_RATIO, HEARTBEAT_EVERY_HOURS)
-from modules.alerting import apply_results, build_message, load_state, save_state
+from modules.alerting import (apply_results, build_message, build_sheet_back,
+                               build_state_failure, clear_sheet_failure, load_state,
+                               mark_sheet_failure, save_state)
 from modules.probe import BrowserManager, PageWorker, build_error_result
 from modules.reporting import (ReportWriter, has_network_evidence, merge_runs,
                                send_to_mattermost)
@@ -86,17 +88,31 @@ async def main():
         return 1
     except SheetUnavailable as e:
         logger.error("Не удалось прочитать Google-таблицу: %s", e)
-        if MATTERMOST_WEBHOOK_URL:
-            send_to_mattermost(
-                MATTERMOST_WEBHOOK_URL,
-                "```\n⚠️ GA-чекер: не удалось прочитать Google-таблицу "
-                "со списком\n\nПричина: " + str(e) + "\n```",
-                timeout=MATTERMOST_TIMEOUT)
+        # Как у domain_checker: о сбое таблицы одно сообщение, дальше тишина до починки.
+        if not MATTERMOST_WEBHOOK_URL:
+            return 1
+        state, _ = load_state(STATE_FILE)
+        if not mark_sheet_failure(state, str(e)):
+            logger.info("О сбое таблицы уже сообщали, повторно не шлём")
+            return 1
+        send_to_mattermost(
+            MATTERMOST_WEBHOOK_URL,
+            "```\n⚠️ GA-чекер: не удалось прочитать Google-таблицу "
+            "со списком\n\nПричина: " + str(e) + "\n```",
+            timeout=MATTERMOST_TIMEOUT)
+        save_state(state, STATE_FILE)
         return 1
     logger.info("Из таблицы: контур %s, адресов %d (из «ошибок» %d)",
                 CONTOUR, len(urls), len(error_urls))
     logger.info("Отсеяно мусорных строк: %d", skipped)
     logger.info("Загружено URL: %d", len(urls))
+    state, first_run = load_state(STATE_FILE)
+    since = clear_sheet_failure(state)
+    if since:
+        if MATTERMOST_WEBHOOK_URL:
+            send_to_mattermost(MATTERMOST_WEBHOOK_URL, build_sheet_back(since),
+                               timeout=MATTERMOST_TIMEOUT)
+        save_state(state, STATE_FILE)
 
     bm = BrowserManager(max_concurrent_pages=MAX_CONCURRENT_PAGES,
                         allow_legacy_tls=ALLOW_LEGACY_TLS)
@@ -152,11 +168,12 @@ async def main():
         # В канал - только смена состояния, как у domain_checker:
         # краткий отчёт целиком остаётся в data/ и в консоли. Память пишется
         # до отправки, чтобы недоступный канал не терял события.
-        state, first_run = load_state(STATE_FILE)
         state, events = apply_results(state, all_results, first_run, LOST_CONFIRM_RUNS)
         text = build_message(state, events, all_results, first_run, GUARD_MIN_ITEMS,
                              MASS_FAILURE_RATIO, HEARTBEAT_EVERY_HOURS)
         saved = save_state(state, STATE_FILE)
+        if not saved:
+            text = build_state_failure(all_results, STATE_FILE)
         logger.info("Событий: появилась аналитика %d, пропала %d",
                     sum(1 for e in events if e["event"] == "appeared"),
                     sum(1 for e in events if e["event"] == "lost"))
