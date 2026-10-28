@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import requests
 
 from modules.alerting import alert, runlog as rl, state as st
-from modules.config import CONFIRM_FAILS
+from modules.config import CONFIRM_FAILS, now_msk
 from modules.probe import failures as f
 from modules.probe.checker import blank_result, check_all, is_healthy, reason_of
 from modules.sources import sheet as sh, targets as tg
@@ -809,7 +809,7 @@ def test_known_bad_silent_until_revived_then_normal_rules():
     for _ in range(10):
         state, events = st.apply_results(state, [_known_bad("dead.example.com", False)])
         state, alerts = st.pick_alerts(state, events,
-                                       now=datetime.now() + timedelta(days=3))
+                                       now=now_msk() + timedelta(days=3))
         assert events == [] and alerts == []
     assert state["domains"]["dead.example.com"]["reported"] is True
 
@@ -829,7 +829,7 @@ def test_known_bad_silent_until_revived_then_normal_rules():
     state, alerts = st.pick_alerts(state, events)
     assert alerts == []
     state, alerts = st.pick_alerts(state, [],
-                                   now=datetime.now() + timedelta(hours=17))
+                                   now=now_msk() + timedelta(hours=17))
     assert [a["alert"] for a in alerts] == ["lone"]
     state, events = st.apply_results(state, [_known_bad("dead.example.com", True)])
     state, alerts = st.pick_alerts(state, events)
