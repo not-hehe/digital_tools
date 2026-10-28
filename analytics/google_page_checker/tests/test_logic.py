@@ -34,17 +34,17 @@ logging.disable(logging.CRITICAL)
 
 import re  # noqa: E402
 from modules import config as cfg  # noqa: E402
-from modules.classifier import classify_site  # noqa: E402
-from modules.network_listener import (NetworkListener, KIND_COLLECT,  # noqa: E402
+from modules.probe.classifier import classify_site  # noqa: E402
+from modules.probe.network_listener import (NetworkListener, KIND_COLLECT,  # noqa: E402
                                       KIND_ERROR_TELEMETRY, KIND_OTHER)
-import modules.page_worker as page_worker_module  # noqa: E402
+import modules.probe.page_worker as page_worker_module  # noqa: E402
 page_worker_module.MIN_WAIT_AFTER_LOAD = 0    # в тестах не ждём реальные секунды
 page_worker_module.NETWORKIDLE_TIMEOUT = 1    # и затишья сети
 page_worker_module.LOAD_STATE_TIMEOUT = 1     # и события load
 page_worker_module.TARGETED_WAIT_TIMEOUT = 1  # и прицельного дожидания
 page_worker_module.RETRY_PAUSE = 0            # и пауз между попытками
-from modules.page_worker import PageWorker, find_html_markers  # noqa: E402
-from modules.report_writer import ReportWriter  # noqa: E402
+from modules.probe.page_worker import PageWorker, find_html_markers  # noqa: E402
+from modules.reporting.report_writer import ReportWriter  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ def test_classifier():
 
 def test_failures_taxonomy():
     """Разбор текста ошибки на вид отказа + политика повторов."""
-    from modules import failures as f
+    from modules.probe import failures as f
 
     cases = {
         "net::ERR_NAME_NOT_RESOLVED at https://x.ru/": f.FAIL_DNS,
@@ -320,15 +320,16 @@ def test_failures_taxonomy():
 
     # каждый вид, объявленный «стоит сменить адрес», должен реально
     # порождать кандидатов — иначе ветка в url_variants мертва
-    from modules.url_variants import alternate_urls
+    from modules.probe.url_variants import alternate_urls
     for kind in f.WORTH_ALTERNATE_URL:
         assert alternate_urls("https://site.ru", kind), kind
 
 
 def test_url_variants():
     """Нормализация адреса, отсев мусора и подбор альтернатив."""
-    from modules import failures as f
-    from modules.url_variants import normalize, looks_like_url, alternate_urls
+    from modules.probe import failures as f
+    from modules.urls import normalize, looks_like_url
+    from modules.probe.url_variants import alternate_urls
 
     assert normalize("example.com") == "https://example.com"
     assert normalize("http://example.com") == "http://example.com"
@@ -618,7 +619,7 @@ def test_container_grouping():
     В боевом прогоне 24 сайта делили GTM-W9D3BC и лежали в отчёте
     двадцатью четырьмя независимыми записями.
     """
-    from modules.report_writer import group_by_container
+    from modules.reporting.report_writer import group_by_container
 
     results = [_run_worker(FakePage([], GTM_HTML), f"site{i}.ru")
                for i in range(3)]
@@ -648,8 +649,8 @@ def test_universal_analytics_is_dead():
     запрашивает» — на боевом прогоне неверная формулировка для 90 сайтов
     из 120.
     """
-    from modules.classifier import is_universal_analytics
-    from modules.page_worker import (detect_broken_reason, extract_container_id,
+    from modules.probe.classifier import is_universal_analytics
+    from modules.probe.page_worker import (detect_broken_reason, extract_container_id,
                                      _extract_probe_target)
 
     assert is_universal_analytics("UA-10659796-44")
@@ -697,7 +698,7 @@ def test_universal_analytics_is_dead():
 
 def test_ua_in_reports():
     """Мёртвый UA выделен в отчётах отдельной секцией и счётчиком."""
-    from modules.report_writer import count_ua_sunset
+    from modules.reporting.report_writer import count_ua_sunset
 
     results = [_run_worker(FakePage([], UA_HTML), f"ua{i}.ru") for i in range(3)]
     results.append(_run_worker(FakePage([], GTM_HTML, probe_status=200), "gtm.ru"))
@@ -757,7 +758,7 @@ def test_mattermost_webhook_source():
 
 def test_broken_reason():
     """Детализация BROKEN по HTTP-статусу загрузки контейнера."""
-    from modules.page_worker import detect_broken_reason
+    from modules.probe.page_worker import detect_broken_reason
 
     def req(url, status):
         return {"url": url, "status": status, "kind": "other_google"}
@@ -802,7 +803,7 @@ def test_targeted_wait():
 
 def test_probe():
     """Зонд: страница не запрашивает контейнер — чекер добывает улику сам."""
-    from modules.page_worker import _extract_probe_target
+    from modules.probe.page_worker import _extract_probe_target
 
     # выбор цели: GTM-контейнер приоритетнее потока G-, «сырые» маркеры чистятся
     target = _extract_probe_target([{"marker": "id=G-XYZ98765"},
@@ -898,7 +899,7 @@ def test_summary_report():
 
 def test_aggregator():
     """Слияние прогонов: лучший результат на URL, без дублей, порядок."""
-    from modules.aggregator import merge_runs, has_network_evidence
+    from modules.reporting.aggregator import merge_runs, has_network_evidence
 
     def res(url, ga=None, collect=None, error=None):
         return {"url": url, "status": cfg.STATUS_ERROR if error else "NONE",
@@ -966,7 +967,7 @@ def test_aggregator_markup_rank():
     запуска не могли исправить ровно тот случай, ради которого их
     и делали.
     """
-    from modules.aggregator import merge_runs, has_strong_markers
+    from modules.reporting.aggregator import merge_runs, has_strong_markers
 
     strong = [{"marker": "GTM-AB12CD", "strength": "strong", "snippet": "x"}]
 
@@ -998,7 +999,7 @@ def test_aggregator_markup_rank():
 def test_notifier():
     """Mattermost-вебхук: успех, ошибка сети (без падения), пустой URL."""
     import urllib.error
-    from modules import notifier
+    from modules.reporting import notifier
 
     class FakeResponse:
         status = 200
@@ -1036,7 +1037,7 @@ def test_notifier():
 
 def test_browser_manager_semaphore():
     """Семафор ограничивает число ОДНОВРЕМЕННО ОТКРЫТЫХ страниц."""
-    from modules.browser_manager import BrowserManager
+    from modules.probe.browser_manager import BrowserManager
 
     limit = 2
     bm = BrowserManager(max_concurrent_pages=limit)
@@ -1076,7 +1077,7 @@ def test_main_error_fallback():
     оставшиеся прогоны на мёртвом браузере.
     """
     import main as m
-    from modules.browser_manager import BrowserManager
+    from modules.probe.browser_manager import BrowserManager
 
     class DeadBM:
         @asynccontextmanager
@@ -1088,7 +1089,7 @@ def test_main_error_fallback():
     assert [r["url"] for r in results] == ["https://lk.example.com", "https://b.example.com"]
     assert all(r["status"] == cfg.STATUS_ERROR for r in results)
     # порядок совпадает с входным файлом, а не с порядком завершения задач
-    merged = __import__("modules.aggregator", fromlist=["merge_runs"]).merge_runs(
+    merged = __import__("modules.reporting.aggregator", fromlist=["merge_runs"]).merge_runs(
         [results, results])
     assert len(merged) == 2, "нормализация адреса не спасла от дублей"
 
@@ -1102,7 +1103,7 @@ def test_main_error_fallback():
 
 def test_browser_launch_args():
     """Устаревший TLS разрешён — иначе сайты на TLS 1.0/1.1 не открыть."""
-    from modules.browser_manager import BrowserManager
+    from modules.probe.browser_manager import BrowserManager
 
     args = BrowserManager(1, allow_legacy_tls=True)._launch_args()
     assert "--ssl-version-min=tls1" in args
@@ -1133,7 +1134,7 @@ def _fake_response(body=b"", ctype="text/csv"):
 
 
 def _sheet_error(opener):
-    from modules.sheet_reader import read_sheet, SheetUnavailable
+    from modules.sources.sheet import read_sheet, SheetUnavailable
     try:
         read_sheet("https://docs.google.com/spreadsheets/d/abc123/edit", opener=opener)
     except SheetUnavailable as e:
@@ -1145,7 +1146,7 @@ def test_sheet_reader():
     """Чтение таблицы: три колонки и понятные причины каждого отказа."""
     import socket
     import urllib.error
-    from modules.sheet_reader import read_sheet, parse_columns, SheetUnavailable
+    from modules.sources.sheet import read_sheet, parse_columns, SheetUnavailable
 
     csv_text = "Ошибки,Внутренний контур,Внешний контур\ne.ru,i.ru,x.ru\n,i2.ru,\n"
     seen = {}
@@ -1179,7 +1180,7 @@ def test_sheet_reader():
 
 
 def test_contour_column():
-    from modules.sheet_reader import contour_column
+    from modules.sources.sheet import contour_column
     assert contour_column(1) == "external"
     assert contour_column(2) == "internal"
     assert contour_column("1") == "external"
@@ -1192,7 +1193,7 @@ def test_contour_column():
 
 
 def test_build_targets():
-    import main as m
+    from modules.sources import targets as m
     columns = {"external": ["a.ru", "https://B.ru/", "нет", "—"],
                "internal": ["in.ru"],
                "errors": ["b.ru", "old.ru", "мусор", "https://old.ru"]}
@@ -1263,7 +1264,7 @@ def test_main_sheet_unavailable():
         raise AssertionError("браузер запущен")
 
     def closed(url):
-        from modules.sheet_reader import SheetUnavailable
+        from modules.sources.sheet import SheetUnavailable
         raise SheetUnavailable("таблица закрыта")
     try:
         m.SHEET_URL, m.CONTOUR = "https://docs.google.com/spreadsheets/d/x/edit", 1

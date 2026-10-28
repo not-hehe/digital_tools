@@ -5,7 +5,7 @@
 import re
 from typing import Optional
 
-from .config import (
+from ..config import (
     STATUS_WORKING,
     STATUS_BROKEN,
     STATUS_SUSPICIOUS,

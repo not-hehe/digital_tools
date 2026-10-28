@@ -4,14 +4,6 @@ import logging
 import sys
 from collections import Counter
 
-from modules.browser_manager import BrowserManager
-from modules.page_worker import PageWorker, build_error_result
-from modules.report_writer import ReportWriter
-from modules.notifier import send_to_mattermost
-from modules.aggregator import merge_runs, has_network_evidence
-from modules.url_variants import normalize, looks_like_url, site_key
-from modules.sheet_reader import (COLUMN_NAMES, SheetUnavailable, read_sheet,
-                                  contour_column)
 from modules.config import (OUTPUT_FILE, SUMMARY_FILE,
                             LOG_FILE, LOG_LEVEL, LOG_FORMAT,
                             MAX_CONCURRENT_PAGES,
@@ -20,6 +12,12 @@ from modules.config import (OUTPUT_FILE, SUMMARY_FILE,
                             MATTERMOST_WEBHOOK_URL, MATTERMOST_TIMEOUT, RUN_COUNT,
                             STATUS_WORKING, STATUS_BROKEN, STATUS_SUSPICIOUS,
                             STATUS_NONE, STATUS_ERROR)
+from modules.probe import BrowserManager, PageWorker, build_error_result
+from modules.reporting import (ReportWriter, has_network_evidence, merge_runs,
+                               send_to_mattermost)
+from modules.sources import (COLUMN_NAMES, SheetUnavailable, build_targets,
+                             contour_column, read_sheet)
+from modules.urls import normalize
 
 
 def setup_logging():
@@ -32,38 +30,6 @@ def setup_logging():
     )
     for lib in ("playwright", "asyncio"):
         logging.getLogger(lib).setLevel(logging.WARNING)
-
-
-def clean_urls(raw_urls, seen=None):
-    """Отсеивает мусор, нормализует и убирает дубли, порядок сохраняется.
-
-    Возвращает (адреса, число отсеянного мусора); seen — общий набор ключей,
-    чтобы вторая колонка не повторяла сайты первой.
-    """
-    seen = set() if seen is None else seen
-    urls, skipped = [], 0
-    for raw in raw_urls:
-        if not looks_like_url(raw):
-            skipped += 1
-            continue
-        url = normalize(raw.strip())
-        key = site_key(url)
-        if key not in seen:
-            seen.add(key)
-            urls.append(url)
-    return urls, skipped
-
-
-def build_targets(columns, contour):
-    """Цели из колонок таблицы: контур плюс «ошибки».
-
-    Сайт и в контуре, и в «ошибках» считается контурным. Возвращает
-    (адреса, множество адресов из «ошибок», число отсеянного мусора).
-    """
-    seen = set()
-    urls, skipped = clean_urls(columns[contour_column(contour)], seen)
-    error_urls, skipped_errors = clean_urls(columns["errors"], seen)
-    return urls + error_urls, set(error_urls), skipped + skipped_errors
 
 
 async def process_urls(urls, bm):

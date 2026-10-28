@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Callable
 
 from playwright.async_api import Page, Request, Response
 
-from .config import GA_COLLECT_PATTERNS, GA_ERROR_MARKERS
+from ..config import GA_COLLECT_PATTERNS, GA_ERROR_MARKERS
 
 logger = logging.getLogger(__name__)
 

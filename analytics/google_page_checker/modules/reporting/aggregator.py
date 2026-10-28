@@ -1,7 +1,7 @@
 import logging
 from typing import Dict, List
 
-from .config import STATUS_ERROR
+from ..config import STATUS_ERROR
 
 logger = logging.getLogger(__name__)
 

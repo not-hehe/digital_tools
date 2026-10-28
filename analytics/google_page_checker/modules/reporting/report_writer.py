@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import Dict, List, TextIO
 
 from .aggregator import has_network_evidence
-from .failures import (FAILURE_ORDER, FAIL_OTHER, failure_label, failure_hint)
-from .classifier import is_universal_analytics
-from .config import (STATUS_WORKING, STATUS_BROKEN, STATUS_SUSPICIOUS,
+from ..probe.failures import (FAILURE_ORDER, FAIL_OTHER, failure_label, failure_hint)
+from ..probe.classifier import is_universal_analytics
+from ..config import (STATUS_WORKING, STATUS_BROKEN, STATUS_SUSPICIOUS,
                      STATUS_NONE, STATUS_ERROR, BROKEN_REASON_LABELS,
                      BROKEN_UA_SUNSET)
 

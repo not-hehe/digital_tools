@@ -47,7 +47,7 @@ import logging  # noqa: E402
 logging.basicConfig(level=logging.WARNING)
 
 from modules import config as cfg  # noqa: E402
-import modules.page_worker as page_worker_module  # noqa: E402
+import modules.probe.page_worker as page_worker_module  # noqa: E402
 page_worker_module.MIN_WAIT_AFTER_LOAD = 0.2
 page_worker_module.NETWORKIDLE_TIMEOUT = 2000
 page_worker_module.LOAD_STATE_TIMEOUT = 2000
@@ -55,8 +55,8 @@ page_worker_module.TARGETED_WAIT_TIMEOUT = 1000
 page_worker_module.PROBE_TIMEOUT = 2000
 page_worker_module.PAGE_TIMEOUT = 10000
 page_worker_module.RETRY_PAUSE = 0.1
-from modules.browser_manager import BrowserManager  # noqa: E402
-from modules.page_worker import PageWorker  # noqa: E402
+from modules.probe.browser_manager import BrowserManager  # noqa: E402
+from modules.probe.page_worker import PageWorker  # noqa: E402
 
 GTM_PAGE = b"""<!doctype html><html><head>
 <script>(function(w,d,s,l,i){})(window,document,'script','dataLayer','GTM-LOCAL01');</script>

@@ -9,8 +9,9 @@ from .network_listener import NetworkListener
 from .classifier import classify_site, is_universal_analytics, UA_ID_RE
 from .failures import (classify_failure, failure_label, is_retryable,
                        worth_alternate_url, FAIL_INVALID_URL, FAIL_OTHER)
-from .url_variants import normalize, looks_like_url, alternate_urls
-from .config import (GA_PATTERNS, HTML_GTM_STRONG_PATTERNS, HTML_GTM_WEAK_PATTERNS,
+from .url_variants import alternate_urls
+from ..urls import normalize, looks_like_url
+from ..config import (GA_PATTERNS, HTML_GTM_STRONG_PATTERNS, HTML_GTM_WEAK_PATTERNS,
                      NAV_WAIT_UNTIL, LOAD_STATE_TIMEOUT,
                      NETWORKIDLE_TIMEOUT, MIN_WAIT_AFTER_LOAD,
                      TARGETED_WAIT_TIMEOUT, PROBE_TIMEOUT,
