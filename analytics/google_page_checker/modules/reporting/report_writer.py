@@ -25,6 +25,21 @@ def _status_of(result: Dict) -> str:
     return result["status"]
 
 
+def summary_header(all_results: List[Dict]) -> List[str]:
+    """Шапка краткого отчёта. Она же шапка сообщений в канал:
+    читатель видит знакомые счётчики и под ними, что изменилось."""
+    contour = [r for r in all_results if not r.get("from_errors")]
+    opened = [r for r in contour if _status_of(r) != STATUS_ERROR]
+    found = sum(1 for r in opened if has_network_evidence(r))
+    return ["=== ОТЧЁТ ПО НАЛИЧИЮ GOOGLE ANALYTICS ===",
+            f"Всего URL в списке          : {len(contour)}",
+            f"Успешно открыто (всего)     : {len(opened)}",
+            f"  └─ Google обнаружено      : {found}",
+            f"  └─ Google не обнаружено   : {len(opened) - found}",
+            f"Ошибок (не удалось открыть) : {len(contour) - len(opened)}",
+            "-" * 60]
+
+
 def group_failures(results: List[Dict]) -> "OrderedDict[str, List[Dict]]":
     """Раскладывает недоступные сайты по виду отказа.
 
@@ -245,25 +260,10 @@ class ReportWriter:
         revived = [r for r in all_results
                    if r.get("from_errors") and has_network_evidence(r)]
         all_results = [r for r in all_results if not r.get("from_errors")]
-        groups = self._group_results(all_results)
-        n_err = len(groups[STATUS_ERROR])
         opened = [r for r in all_results if _status_of(r) != STATUS_ERROR]
+        ga_found = [r for r in opened if has_network_evidence(r)]
 
-        ga_found, ga_not_found = [], []
-        for r in opened:
-            if has_network_evidence(r):
-                ga_found.append(r)
-            else:
-                ga_not_found.append(r)
-
-        lines = []
-        lines.append("=== ОТЧЁТ ПО НАЛИЧИЮ GOOGLE ANALYTICS ===")
-        lines.append(f"Всего URL в списке          : {len(all_results)}")
-        lines.append(f"Успешно открыто (всего)     : {len(opened)}")
-        lines.append(f"  └─ Google обнаружено      : {len(ga_found)}")
-        lines.append(f"  └─ Google не обнаружено   : {len(ga_not_found)}")
-        lines.append(f"Ошибок (не удалось открыть) : {n_err}")
-        lines.append("-" * 60)
+        lines = summary_header(all_results)
 
         if ga_found:
             lines.append("--- Google обнаружен ---")

@@ -192,5 +192,13 @@ CONTOUR = 1  # 1 внешний, 2 внутренний
 SHEET_URL_FILE = SECRETS_DIR / "sheet_url.txt"
 SHEET_URL = _read_secret("GPC_SHEET_URL", SHEET_URL_FILE)
 
+# Память и оповещения: в канал уходит смена состояния - у сайта
+# появились или пропали запросы в Google, - а не краткий отчёт каждый прогон.
+STATE_FILE = Path(os.environ.get("GPC_STATE_FILE", "") or DATA_DIR / "state.json")
+LOST_CONFIRM_RUNS = 2       # прогонов подряд без Google, чтобы сообщить о пропаже
+GUARD_MIN_ITEMS = 10        # меньше событий - защита от лавины молчит
+MASS_FAILURE_RATIO = 0.5    # доля сайтов с Google, с которой виним сам чекер
+HEARTBEAT_EVERY_HOURS = 24  # "GA-чекер жив", если изменений нет; 0 выключает
+
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

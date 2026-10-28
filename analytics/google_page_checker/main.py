@@ -11,7 +11,10 @@ from modules.config import (OUTPUT_FILE, SUMMARY_FILE,
                             SHEET_URL, CONTOUR,
                             MATTERMOST_WEBHOOK_URL, MATTERMOST_TIMEOUT, RUN_COUNT,
                             STATUS_WORKING, STATUS_BROKEN, STATUS_SUSPICIOUS,
-                            STATUS_NONE, STATUS_ERROR)
+                            STATUS_NONE, STATUS_ERROR, STATE_FILE,
+                            LOST_CONFIRM_RUNS, GUARD_MIN_ITEMS,
+                            MASS_FAILURE_RATIO, HEARTBEAT_EVERY_HOURS)
+from modules.alerting import apply_results, build_message, load_state, save_state
 from modules.probe import BrowserManager, PageWorker, build_error_result
 from modules.reporting import (ReportWriter, has_network_evidence, merge_runs,
                                send_to_mattermost)
@@ -146,20 +149,40 @@ async def main():
             counts.get(STATUS_ERROR, 0), http_errors,
         )
 
-        # Отправка в Mattermost (если настроен вебхук); ``` сохраняет
-        # моноширинное выравнивание счётчиков в сообщении
-        if MATTERMOST_WEBHOOK_URL:
-            send_to_mattermost(MATTERMOST_WEBHOOK_URL,
-                               "```\n" + summary_text + "```",
-                               timeout=MATTERMOST_TIMEOUT)
-        else:
+        # В канал - только смена состояния, как у domain_checker:
+        # краткий отчёт целиком остаётся в data/ и в консоли. Память пишется
+        # до отправки, чтобы недоступный канал не терял события.
+        state, first_run = load_state(STATE_FILE)
+        state, events = apply_results(state, all_results, first_run, LOST_CONFIRM_RUNS)
+        text = build_message(state, events, all_results, first_run, GUARD_MIN_ITEMS,
+                             MASS_FAILURE_RATIO, HEARTBEAT_EVERY_HOURS)
+        saved = save_state(state, STATE_FILE)
+        logger.info("Событий: появилась аналитика %d, пропала %d",
+                    sum(1 for e in events if e["event"] == "appeared"),
+                    sum(1 for e in events if e["event"] == "lost"))
+        if text and MATTERMOST_WEBHOOK_URL:
+            send_to_mattermost(MATTERMOST_WEBHOOK_URL, text, timeout=MATTERMOST_TIMEOUT)
+        elif text:
             logger.info("Вебхук Mattermost не задан (GPC_MATTERMOST_WEBHOOK) "
-                        "— отчёт не отправляем")
+                        "— сообщение не отправляем")
+        else:
+            logger.info("Изменений нет — в канал ничего не уходит")
 
         # Краткий отчёт — последним блоком в консоли, удобно копировать в чат
         print("\n" + summary_text)
+        if not saved:
+            return 1
     else:
         logger.warning("Нет результатов.")
+        # Без результатов память не трогаем: иначе следующий прогон принял бы
+        # пустой список за пропажу Google у всех.
+        if MATTERMOST_WEBHOOK_URL:
+            send_to_mattermost(MATTERMOST_WEBHOOK_URL,
+                               "```\n⚠️ GA-чекер: прогон не дал результатов "
+                               "(браузер не запустился или упал), отчёты "
+                               "не обновлены. Причина в logs/app.log\n```",
+                               timeout=MATTERMOST_TIMEOUT)
+        return 1
 
 
 if __name__ == "__main__":

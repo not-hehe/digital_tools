@@ -1302,6 +1302,240 @@ def test_main_sheet_unavailable():
             setattr(m, n, v)
 
 
+
+# ---------------------------------------------------------------------------
+# Оповещения: память между прогонами и смена состояния
+# ---------------------------------------------------------------------------
+
+def _site(url, ga, status=None, container="GTM-ABC1", from_errors=False):
+    """Результат прогона по сайту: ga=True - ушёл запрос в Google, None - не открылся."""
+    r = {"url": url, "status": status or (cfg.STATUS_ERROR if ga is None else
+                                          cfg.STATUS_WORKING if ga else cfg.STATUS_NONE),
+         "container_id": container if ga else None, "collect_requests": [], "ga_requests": []}
+    if ga:
+        r["collect_requests"] = [{"url": "https://www.google-analytics.com/g/collect"}]
+    if from_errors:
+        r["from_errors"] = True
+    return r
+
+
+def _run(state, results, first=False, confirm=2):
+    from modules.alerting import apply_results
+    return apply_results(state, results, first, confirm)
+
+
+def test_alert_first_run_is_baseline():
+    """Первый прогон запоминает, событий нет, в канал одна строка о начале наблюдения."""
+    from modules.alerting import build_message, empty_state
+    results = [_site("https://a.example.com", True), _site("https://b.example.com", False),
+               _site("https://c.example.com", None)]
+    state, events = _run(empty_state(), results, first=True)
+    assert events == []
+    assert {u: s["ga"] for u, s in state["sites"].items()} == {
+        "https://a.example.com": True, "https://b.example.com": False, "https://c.example.com": None}
+    text = build_message(state, events, results, True, 10, 0.5, 24)
+    assert "начал следить" in text and "  └─ Google обнаружено      : 1" in text, text
+    assert "Успешно открыто (всего)     : 2" in text and text.rstrip("`\n").endswith("КОНЕЦ ОТЧЁТА"), text
+    assert state["last_heartbeat"], "первое сообщение засчитывается как признак жизни"
+
+
+def test_alert_appeared_and_new_site():
+    """Сайт без Google начал слать запросы - сразу событие; новый сайт с Google - тоже."""
+    from modules.alerting import EVENT_APPEARED, build_message, empty_state
+    state, _ = _run(empty_state(), [_site("https://a.example.com", False)], first=True)
+    results = [_site("https://a.example.com", True, container="GTM-NEW1"),
+               _site("https://n.example.com", True, container="G-XYZ")]
+    state, events = _run(state, results)
+    assert [(e["event"], e["url"], e["new"]) for e in events] == [
+        (EVENT_APPEARED, "https://a.example.com", False),
+        (EVENT_APPEARED, "https://n.example.com", True)]
+    text = build_message(state, events, results, False, 10, 0.5, 24)
+    assert "🟢 Появилась Google-аналитика: 2" in text, text
+    assert "  https://a.example.com (WORKING, GTM-NEW1)" in text, text
+    assert "  https://n.example.com (WORKING, G-XYZ) - новый в списке" in text, text
+    assert "Пропала" not in text
+
+
+def test_alert_lost_needs_two_runs_and_flap_resets():
+    """Пропажу подтверждают два прогона подряд; вернулся Google между ними - счёт сначала."""
+    from modules.alerting import EVENT_LOST, build_message, empty_state
+    a = "https://a.example.com"
+    state, _ = _run(empty_state(), [_site(a, True, container="GTM-OLD1")], first=True)
+    state, events = _run(state, [_site(a, False)])
+    assert events == [] and state["sites"][a]["misses"] == 1
+    state, events = _run(state, [_site(a, True, container="GTM-NEW2")])
+    assert events == [] and state["sites"][a]["misses"] == 0, "мигание не должно дать события"
+    state, events = _run(state, [_site(a, False)])
+    assert events == []
+    state, events = _run(state, [_site(a, False)])
+    assert [e["event"] for e in events] == [EVENT_LOST]
+    assert state["sites"][a]["ga"] is False
+    text = build_message(state, events, [_site(a, False)], False, 10, 0.5, 24)
+    # В «было» - последний увиденный идентификатор, а не первый.
+    assert "🔴 Пропала Google-аналитика: 1" in text and "(было GTM-NEW2, сейчас NONE)" in text, text
+
+
+def test_alert_unopened_site_changes_nothing():
+    """Не открылся - памяти нечего сказать: ни пропажи, ни счёта."""
+    from modules.alerting import empty_state
+    a = "https://a.example.com"
+    state, _ = _run(empty_state(), [_site(a, True)], first=True)
+    for _ in range(3):
+        state, events = _run(state, [_site(a, None)])
+        assert events == [] and state["sites"][a]["ga"] is True and state["sites"][a]["misses"] == 0
+    # Не открывался с первого прогона, потом открылся с Google - не событие: он не был «без Google».
+    b = "https://b.example.com"
+    state, _ = _run(state, [_site(a, True), _site(b, None)])
+    state, events = _run(state, [_site(a, True), _site(b, True)])
+    assert events == [] and state["sites"][b]["ga"] is True
+
+
+def test_alert_removed_site_forgotten_and_errors_column_marked():
+    from modules.alerting import build_message, empty_state
+    a, b = "https://a.example.com", "https://b.example.com"
+    state, _ = _run(empty_state(), [_site(a, True), _site(b, False, from_errors=True)], first=True)
+    results = [_site(b, True, from_errors=True)]
+    state, events = _run(state, results)
+    assert list(state["sites"]) == [b], "убранный из таблицы сайт забыт"
+    text = build_message(state, events, results, False, 10, 0.5, 24)
+    assert "  https://b.example.com (WORKING, GTM-ABC1) - из колонки ошибок" in text, text
+
+
+def test_alert_mass_loss_guard():
+    """Google пропал разом у половины сайтов: одна строка про чекер, без списка."""
+    from modules.alerting import build_message, empty_state
+    urls = ["https://s{}.example.com".format(i) for i in range(20)]
+    state, _ = _run(empty_state(), [_site(u, True) for u in urls], first=True)
+    lost_now = [_site(u, False) for u in urls[:12]] + [_site(u, True) for u in urls[12:]]
+    state, events = _run(state, lost_now, confirm=1)
+    assert len(events) == 12
+    text = build_message(state, events, lost_now, False, 10, 0.5, 24)
+    assert "Похоже, дело в самом чекере: Google пропал сразу у 12 из 20 сайтов" in text, text
+    assert "s0.example.com" not in text, "списка быть не должно"
+    back = [_site(u, True) for u in urls]
+    state, events = _run(state, back)
+    text = build_message(state, events, back, False, 10, 0.5, 24)
+    assert "Google снова виден сразу у 12 сайтов" in text and "s0.example.com" not in text, text
+    few = [_site(u, False) for u in urls[:3]] + [_site(u, True) for u in urls[3:]]
+    state, events = _run(state, few, confirm=1)
+    text = build_message(state, events, few, False, 10, 0.5, 24)
+    assert "🔴 Пропала Google-аналитика: 3" in text and "s0.example.com" in text, text
+
+
+def test_alert_heartbeat_and_silence():
+    """Изменений нет: «жив» раз в сутки, иначе тишина."""
+    from datetime import datetime
+    from modules.alerting import build_message, empty_state
+    results = [_site("https://a.example.com", True)]
+    state, _ = _run(empty_state(), results, first=True)
+    now = datetime(2026, 10, 28, 12, 0)
+    state["last_heartbeat"] = "2026-10-28T09:00:00"
+    assert build_message(state, [], results, False, 10, 0.5, 24, now=now) is None
+    state["last_heartbeat"] = "2026-10-27T11:00:00"
+    text = build_message(state, [], results, False, 10, 0.5, 24, now=now)
+    assert "GA-чекер жив, изменений нет" in text and "  └─ Google обнаружено      : 1" in text, text
+    assert state["last_heartbeat"] == "2026-10-28T12:00:00"
+    assert build_message(state, [], results, False, 10, 0.5, 0, now=now) is None, "0 выключает"
+
+
+
+def test_alert_message_keeps_summary_header():
+    """Шапка сообщения - та же, что у краткого отчёта, строка в строку."""
+    from modules.alerting import build_message, empty_state
+    from modules.reporting import ReportWriter
+    results = [_site("https://a.example.com", True), _site("https://b.example.com", False),
+               _site("https://c.example.com", None), _site("https://d.example.com", True, from_errors=True)]
+    state, _ = _run(empty_state(), [_site("https://a.example.com", False)] + results[1:], first=True)
+    state, events = _run(state, results)
+    text = build_message(state, events, results, False, 10, 0.5, 24)
+    summary = ReportWriter(Path("unused")).build_summary(results)
+    head = summary.splitlines()[:7]
+    assert head[0] == "=== ОТЧЁТ ПО НАЛИЧИЮ GOOGLE ANALYTICS ===" and head[-1] == "-" * 60, head
+    assert text.splitlines()[1:8] == head, (text, head)
+    body = text.splitlines()[8:]
+    assert body[0] == "🟢 Появилась Google-аналитика: 1" and body[1].startswith("  https://a.example.com"), body
+    assert body[-2:] == ["КОНЕЦ ОТЧЁТА", "```"], body
+
+def test_alert_state_file_roundtrip_and_broken():
+    from modules.alerting import empty_state, load_state, save_state
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "sub" / "state.json"
+        state, first = load_state(path)
+        assert first and state == empty_state()
+        state["sites"]["https://a.example.com"] = {"ga": True, "misses": 0}
+        assert save_state(state, path)
+        again, first = load_state(path)
+        assert not first and again["sites"] == state["sites"] and again["updated_at"]
+        assert not list(path.parent.glob("*.tmp"))
+        path.write_text("{битый json", encoding="utf-8")
+        state, first = load_state(path)
+        assert first and state["sites"] == {}, "битая память - наблюдение заново"
+        blocker = Path(tmp) / "file"
+        blocker.write_text("x", encoding="utf-8")
+        assert not save_state(empty_state(), blocker / "state.json"), "не записалось - False"
+
+
+def test_main_alerts_only_changes():
+    """main(): первый прогон шлёт строку о начале, второй без изменений молчит,
+    третий шлёт появление; без результатов - алерт и код 1, память не тронута."""
+    import main as m
+
+    class FakeBM:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def is_alive(self):
+            return True
+
+    plan = []
+
+    async def fake_process(urls, bm):
+        return [_site(u, plan[0].get(u)) for u in urls]
+
+    names = ("SHEET_URL", "CONTOUR", "MATTERMOST_WEBHOOK_URL", "BrowserManager", "send_to_mattermost",
+             "setup_logging", "read_sheet", "process_urls", "STATE_FILE", "RUN_COUNT",
+             "OUTPUT_FILE", "SUMMARY_FILE")
+    saved = {n: getattr(m, n) for n in names}
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            m.SHEET_URL, m.CONTOUR, m.RUN_COUNT = "https://docs.google.com/spreadsheets/d/x/edit", 1, 1
+            m.MATTERMOST_WEBHOOK_URL = "http://127.0.0.1:9/hooks/t"
+            m.BrowserManager, m.process_urls, m.setup_logging = FakeBM, fake_process, lambda: None
+            m.send_to_mattermost = lambda url, text, timeout=10: sent.append(text)
+            m.read_sheet = lambda url: {"errors": [], "internal": [],
+                                        "external": ["a.example.com", "b.example.com"]}
+            m.STATE_FILE = Path(tmp) / "state.json"
+            m.OUTPUT_FILE, m.SUMMARY_FILE = Path(tmp) / "r.txt", Path(tmp) / "s.txt"
+            a, b = "https://a.example.com", "https://b.example.com"
+            plan[:] = [{a: True, b: False}]
+            assert asyncio.run(m.main()) is None
+            assert len(sent) == 1 and "начал следить" in sent[0], sent
+            assert m.STATE_FILE.exists()
+            sent.clear()
+            assert asyncio.run(m.main()) is None and sent == [], "без изменений и до суток - тишина"
+            plan[:] = [{a: True, b: True}]
+            assert asyncio.run(m.main()) is None
+            assert len(sent) == 1 and "Появилась Google-аналитика: 1" in sent[0] and b in sent[0], sent
+            before = m.STATE_FILE.read_text(encoding="utf-8")
+            sent.clear()
+
+            async def nothing(urls, bm):
+                return []
+            m.process_urls = nothing
+            assert asyncio.run(m.main()) == 1
+            assert sent and "прогон не дал результатов" in sent[0], sent
+            assert m.STATE_FILE.read_text(encoding="utf-8") == before, "память не тронута"
+        finally:
+            for n, v in saved.items():
+                setattr(m, n, v)
+
 def main():
     tests = [
         test_config_patterns,
@@ -1335,6 +1569,16 @@ def main():
         test_build_targets,
         test_summary_from_errors,
         test_main_sheet_unavailable,
+        test_alert_first_run_is_baseline,
+        test_alert_appeared_and_new_site,
+        test_alert_lost_needs_two_runs_and_flap_resets,
+        test_alert_unopened_site_changes_nothing,
+        test_alert_removed_site_forgotten_and_errors_column_marked,
+        test_alert_mass_loss_guard,
+        test_alert_heartbeat_and_silence,
+        test_alert_message_keeps_summary_header,
+        test_alert_state_file_roundtrip_and_broken,
+        test_main_alerts_only_changes,
     ]
     failed = 0
     for test in tests:
